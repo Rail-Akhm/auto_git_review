@@ -31,7 +31,12 @@ class Settings:
     llm_url: str
     llm_api_key: str
     llm_model: str
+    post_comments: bool
     verify_ssl: bool = VERIFY_SSL
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
 
 
 def get_settings() -> Settings:
@@ -43,5 +48,6 @@ def get_settings() -> Settings:
         llm_url=os.environ.get("LLM_URL", LLM_URL_DEFAULT).rstrip("/"),
         llm_api_key=os.environ.get("LLM_API_KEY", "").strip(),
         llm_model=os.environ.get("LLM_MODEL", "qwen3:latest"),
+        post_comments=_env_bool("POST_COMMENTS", "false"),
         verify_ssl=VERIFY_SSL,
     )

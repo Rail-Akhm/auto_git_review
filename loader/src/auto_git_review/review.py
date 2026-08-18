@@ -3,6 +3,7 @@
 import difflib
 import json
 import logging
+from dataclasses import replace
 
 from .alm import AlmClient
 from .config import get_settings
@@ -20,6 +21,9 @@ CHANGE_TYPE_LABELS = {
     "delete": "удалён",
     "none": "без изменений",
 }
+
+# Маркер, по которому узнаём собственные комментарии бота (для dedup при повторных запусках).
+COMMENT_MARKER = "auto_git_review"
 
 
 def _parse_json_response(text: str):
@@ -78,12 +82,63 @@ def _describe_work_items(alm: AlmClient, pr_id: int) -> str:
     return "\n".join(descriptions)
 
 
-def _format_change(change: dict) -> str:
-    """Читаемое представление одного изменения файла (unified diff или полное содержимое)."""
+def _format_review_comment(parsed: dict) -> str:
+    """Формирует markdown-текст общего комментария к PR из результата ревью."""
+    verdict = parsed.get("verdict", "?")
+    summary = (parsed.get("summary") or "").strip()
+    comments = parsed.get("comments") or []
+
+    lines = [f"**Автоматическое ревью ({COMMENT_MARKER})**", ""]
+    lines.append(f"**Вердикт:** {verdict}")
+    if summary:
+        lines.append("")
+        lines.append("**Резюме:**")
+        lines.append(summary)
+    if comments:
+        lines.append("")
+        lines.append("**Замечания:**")
+        for c in comments:
+            file_path = c.get("file", "")
+            line = c.get("line")
+            severity = c.get("severity", "")
+            text = (c.get("text") or "").strip()
+            locator = f"{file_path}:{line}" if line else file_path
+            lines.append(f"- `{locator}` ({severity}): {text}")
+    return "\n".join(lines)
+
+
+def _already_reviewed(alm: AlmClient, pr_id: int) -> bool:
+    """True, если у PR уже есть наш не-удалённый комментарий (по маркеру COMMENT_MARKER).
+
+    Проверяем по маркеру в тексте, а не по автору: владелец PAT — реальный
+    пользователь, у которого могут быть и собственные комментарии. Маркер
+    однозначно отделяет комментарий бота.
+    """
+    try:
+        threads = alm.get_threads(pr_id).get("value", [])
+    except Exception as exc:
+        # При ошибке проверки не можем гарантировать отсутствие дубля — пропускаем
+        # постинг (лучше не отправить, чем отправить второй раз).
+        logger.warning("Не удалось проверить комментарии PR #%s: %s — пропускаю отправку", pr_id, exc)
+        return True
+
+    for thread in threads:
+        for comment in thread.get("comments", []):
+            if comment.get("isDeleted"):
+                continue
+            if COMMENT_MARKER in (comment.get("content") or ""):
+                return True
+    return False
+
+
+def _format_change(change: dict, new_content: str, old_content: str) -> str:
+    """Читаемое представление одного изменения файла (unified diff или полное содержимое).
+
+    new_content / old_content передаются сюда уже вытянутыми через alm.get_file_content()
+    (endpoint iterations/{id}/changes контента не содержит).
+    """
     change_type = change.get("changeType", "edit")
     path = (change.get("item") or {}).get("path", "?")
-    new_content = (change.get("newContent") or {}).get("content") or ""
-    old_content = (change.get("originalContent") or {}).get("content") or ""
 
     if change_type == "add":
         return _truncate(f"[НОВЫЙ ФАЙЛ] {path}\n{new_content}")
@@ -115,12 +170,16 @@ def _format_history(commits: list) -> str:
     return "\n".join(lines)
 
 
-def _build_files_context(alm: AlmClient, changes: list, target_commit: str) -> str:
-    """Для каждого изменённого файла: diff + история (или пометка «новый файл»)."""
+def _build_files_context(alm: AlmClient, changes: list, source_commit: str, target_commit: str) -> str:
+    """Для каждого изменённого файла: diff (новый/старый контент) + история."""
     sections = []
     for change in changes:
         change_type = change.get("changeType", "edit")
-        path = (change.get("item") or {}).get("path", "?")
+        item = change.get("item") or {}
+        path = item.get("path", "?")
+        # Пропускаем tree-объекты (директории), если они вдруг попали в список.
+        if item.get("gitObjectType") and item.get("gitObjectType") != "blob":
+            continue
 
         if change_type == "add":
             history_text = "(истории нет — файл создаётся впервые)"
@@ -132,7 +191,21 @@ def _build_files_context(alm: AlmClient, changes: list, target_commit: str) -> s
                 logger.warning("Не удалось получить историю файла %s: %s", path, exc)
                 history_text = "(историю получить не удалось)"
 
-        diff_text = _format_change(change)
+        # Контент: для add — только новый, для delete — только старый, для edit — оба.
+        new_content = ""
+        old_content = ""
+        try:
+            if change_type in ("add", "edit"):
+                new_content = alm.get_file_content(path, source_commit)
+        except Exception as exc:
+            logger.warning("Не удалось получить новый контент %s: %s", path, exc)
+        try:
+            if change_type in ("delete", "edit"):
+                old_content = alm.get_file_content(path, target_commit)
+        except Exception as exc:
+            logger.warning("Не удалось получить старый контент %s: %s", path, exc)
+
+        diff_text = _format_change(change, new_content, old_content)
         sections.append(
             f"### Файл: {path} ({CHANGE_TYPE_LABELS.get(change_type, change_type)})\n"
             f"История предыдущих изменений:\n{history_text}\n\n"
@@ -141,19 +214,33 @@ def _build_files_context(alm: AlmClient, changes: list, target_commit: str) -> s
     return "\n".join(sections) if sections else "(изменения не получены)"
 
 
-def run_review(log=None):
-    """Главная функция: ревью всех открытых PR. Подробно логирует каждый шаг."""
+def run_review(log=None, repo: str = None, post_comment: bool = False, prompt_name: str = None):
+    """Главная функция: ревью всех открытых PR. Подробно логирует каждый шаг.
+
+    Параметры (передаются из таски Airflow):
+      - repo         — имя репозитория в ALM (если None — из настроек/config.py);
+      - post_comment — отправлять ли резюме комментарием в PR;
+      - prompt_name  — файл промпта в prompts/ (для разных типов репозиториев).
+    """
     log = log or logger
 
     log.info("=" * 60)
     log.info("СТАРТ: автоматическое ревью открытых PR")
 
     settings = get_settings()
+    if repo:
+        settings = replace(settings, azure_repo=repo)
+    if post_comment:
+        settings = replace(settings, post_comments=True)
+    prompt_name = prompt_name or "review_prompt.md"
+
     log.info("Настройки загружены:")
     log.info("  ALM URL      : %s", settings.azure_url)
     log.info("  Репозиторий  : %s", settings.azure_repo)
     log.info("  LLM модель   : %s", settings.llm_model)
     log.info("  LLM endpoint : %s", settings.llm_url)
+    log.info("  Промпт       : %s", prompt_name)
+    log.info("  Пост-коммент : %s", settings.post_comments)
 
     if not settings.azure_pat:
         raise RuntimeError("Не задан AZURE_DEVOPS_PAT (пустой токен).")
@@ -162,8 +249,8 @@ def run_review(log=None):
 
     alm = AlmClient(settings)
     llm = LlmClient(settings)
-    prompt_template = load_prompt()
-    log.info("Промпт загружен из prompts/review_prompt.md (%d символов)", len(prompt_template))
+    prompt_template = load_prompt(prompt_name)
+    log.info("Промпт загружен из prompts/%s (%d символов)", prompt_name, len(prompt_template))
 
     log.info("Шаг 1: получаю список открытых PR из ALM...")
     prs = alm.list_open_pull_requests().get("value", [])
@@ -194,20 +281,24 @@ def run_review(log=None):
         work_items_text = _describe_work_items(alm, pr_id)
         log.info("    %s", work_items_text.replace("\n", "\n    "))
 
-        log.info("  Шаг 4: собираю diff PR (target -> source)...")
+        log.info("  Шаг 4: собираю список изменённых файлов PR...")
         changes = []
         if not src_commit or not tgt_commit:
             log.warning("    Нет коммитов для diff, изменения не собраны.")
         else:
             try:
-                diff_data = alm.get_pr_changes(src_commit, tgt_commit)
-                changes = diff_data.get("changes", [])
+                iterations = alm.get_pr_iterations(pr_id).get("value", [])
+                if iterations:
+                    last_iteration = max(it["id"] for it in iterations)
+                    changes = alm.get_pr_iteration_changes(pr_id, last_iteration).get(
+                        "changeEntries", []
+                    )
             except Exception as exc:
-                log.warning("    Не удалось получить diff PR #%s: %s", pr_id, exc)
+                log.warning("    Не удалось получить список файлов PR #%s: %s", pr_id, exc)
         log.info("    Изменённых файлов: %d", len(changes))
 
-        log.info("  Шаг 5: собираю контекст (история каждого файла)...")
-        files_text = _build_files_context(alm, changes, tgt_commit)
+        log.info("  Шаг 5: собираю контекст (diff и история каждого файла)...")
+        files_text = _build_files_context(alm, changes, src_commit, tgt_commit)
 
         log.info("  Шаг 6: формирую промпт и вызываю LLM (%s)...", settings.llm_model)
         messages = [
@@ -233,6 +324,21 @@ def run_review(log=None):
             log.info("    Вердикт: %s", verdict)
             log.info("    Резюме: %s", summary)
             log.info("    Комментариев: %d", len(comments))
+
+            if settings.post_comments:
+                if _already_reviewed(alm, pr_id):
+                    log.info("    Комментарий от бота уже есть — пропускаю отправку.")
+                else:
+                    log.info("    Отправляю резюме в PR как комментарий...")
+                    try:
+                        comment_text = _format_review_comment(parsed)
+                        thread = alm.create_thread_comment(pr_id, comment_text)
+                        log.info("    Комментарий создан, thread id=%s", thread.get("id"))
+                    except Exception as exc:
+                        log.warning("    Не удалось отправить комментарий в PR #%s: %s", pr_id, exc)
+            else:
+                log.info("    Отправка комментариев отключена (POST_COMMENTS=false).")
+
             results.append({"pr_id": pr_id, "verdict": verdict, "comments": comments})
         else:
             log.warning("    Не удалось разобрать JSON-ответ, сырой текст:")

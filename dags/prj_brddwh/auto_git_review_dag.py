@@ -1,4 +1,11 @@
-"""Прототип ДАГа: запуск ревью открытых PR в одной таске с подробным логированием.
+"""Прототип ДАГа: запуск ревью открытых PR по одному или нескольким репозиториям.
+
+Каждая таска — отдельный репозиторий со своим промптом. Параметры передаются
+напрямую в таску через op_kwargs (без Airflow Variables):
+
+  - repo         — имя репозитория в Azure DevOps Server;
+  - post_comment — отправлять ли резюме комментарием в PR (True/False);
+  - prompt_name  — файл промпта в loader/src/auto_git_review/prompts/.
 
 Адреса и секреты берутся из Airflow Connections:
   - api_git    : Azure DevOps Server (host, port, password=PAT)
@@ -17,7 +24,7 @@ from airflow.hooks.base import BaseHook
 
 class DAGConfiguration:
     DAG_NAME = "SERV__auto_git_review"
-    DAG_DESCRIPTION = "Автоматическое ревью открытых PR в Azure DevOps Server (Greenplum)"
+    DAG_DESCRIPTION = "Автоматическое ревью открытых PR в Azure DevOps Server"
     DAG_MAX_ACTIVE_TASKS = 1
 
     # Airflow Connections
@@ -27,6 +34,21 @@ class DAGConfiguration:
     # Пути, которые не помещаются в стандартные поля Connection (host/port/login/password)
     ALM_BASE_PATH = "/TFS/GPN/U200001871_mkhdbrd"
     LLM_PATH = "/chat/completions"  # префикс /v1 задан в поле host коннектора llm_server
+
+    # Список репозиториев для ревью. Каждый элемент — отдельная таска.
+    # В будущем сюда добавляются новые репозитории (ClickHouse, ДАГи Airflow и т.д.)
+    # со своими промптами.
+    REPOSITORIES = [
+        {
+            "task_id": "review_greenplum",
+            "repo": "U200001871_mkhdbrd_greenplum",
+            "prompt_name": "review_prompt.md",
+            "post_comment": True,
+        },
+        # Пример для будущих репозиториев:
+        # {"task_id": "review_clickhouse", "repo": "<repo_clickhouse>",
+        #  "prompt_name": "review_prompt_clickhouse.md", "post_comment": True},
+    ]
 
     DAG_DEFAULT_ARGS = {
         "owner": "airflow",
@@ -92,7 +114,7 @@ def _apply_connections():
     log.info("LLM_URL          = %s", os.environ.get("LLM_URL"))
 
 
-def run_wrapper(**kwargs):
+def run_wrapper(repo=None, post_comment=False, prompt_name=None, **kwargs):
     # 1. Ищем и добавляем loader/src в sys.path (паттерн проекта).
     import sys
 
@@ -116,10 +138,10 @@ def run_wrapper(**kwargs):
     # 2. Настройки из Airflow Connections.
     _apply_connections()
 
-    # 3. Запускаем основную функцию ревью (подробное логирование внутри).
+    # 3. Запускаем основную функцию ревью с параметрами таски.
     from auto_git_review import review
 
-    return review.run_review()
+    return review.run_review(repo=repo, post_comment=post_comment, prompt_name=prompt_name)
 
 
 with DAG(
@@ -131,8 +153,14 @@ with DAG(
     max_active_tasks=DC.DAG_MAX_ACTIVE_TASKS,
     default_args=DC.DAG_DEFAULT_ARGS,
 ) as dag:
-    review_task = PythonOperator(
-        task_id="run_review",
-        python_callable=run_wrapper,
-        executor_config=DC.RESOURCE_CONFIG,
-    )
+    for _cfg in DC.REPOSITORIES:
+        PythonOperator(
+            task_id=_cfg["task_id"],
+            python_callable=run_wrapper,
+            op_kwargs={
+                "repo": _cfg["repo"],
+                "post_comment": _cfg.get("post_comment", False),
+                "prompt_name": _cfg.get("prompt_name"),
+            },
+            executor_config=DC.RESOURCE_CONFIG,
+        )
