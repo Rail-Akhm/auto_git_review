@@ -51,3 +51,26 @@ class AlmClient:
 
     def get_work_item(self, work_item_id: int) -> dict:
         return self._get(f"_apis/wit/workitems/{work_item_id}")
+
+    def get_pr_changes(self, source_commit: str, target_commit: str, repo: str = None) -> dict:
+        """Diff PR: изменённые файлы с содержимым (от target_commit к source_commit)."""
+        repo = repo or self.settings.azure_repo
+        return self._get(
+            f"_apis/git/repositories/{repo}/diffs/commits",
+            params={
+                "baseVersion": target_commit,
+                "targetVersion": source_commit,
+            },
+        )
+
+    def get_file_commits(self, path: str, target_version: str, top: int = 5, repo: str = None) -> dict:
+        """История коммитов, затрагивавших файл path (до версии target_version)."""
+        repo = repo or self.settings.azure_repo
+        params = {
+            "searchCriteria.itemPath": path,
+            "$top": top,
+        }
+        if target_version:
+            params["searchCriteria.itemVersion.version"] = target_version
+            params["searchCriteria.itemVersion.versionType"] = "commit"
+        return self._get(f"_apis/git/repositories/{repo}/commits", params=params)
