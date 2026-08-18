@@ -28,6 +28,11 @@ class DAGConfiguration:
     DAG_DESCRIPTION = "Автоматическое ревью открытых PR в Azure DevOps Server"
     DAG_MAX_ACTIVE_TASKS = 10
 
+    # Максимум батчей на один PR (для одного запуска ревью). Если PR порождает
+    # больше батчей (тяжёлые случаи, напр. тысячи файлов) — полный анализ невозможен,
+    # и формируется общее резюме с числом файлов вместо вызова LLM.
+    MAX_BATCHES = 20
+
     # Airflow Connections
     CONN_ALM = "api_git"
     CONN_LLM = "llm_server"
@@ -153,7 +158,7 @@ def _apply_connections(project=None):
     log.info("LLM_URL              = %s", os.environ.get("LLM_URL"))
 
 
-def run_wrapper(repo=None, project=None, post_comment=False, prompt_name=None, **kwargs):
+def run_wrapper(repo=None, project=None, post_comment=False, prompt_name=None, max_batches=20, **kwargs):
     # 1. Ищем и добавляем loader/src в sys.path (паттерн проекта).
     import sys
 
@@ -180,7 +185,7 @@ def run_wrapper(repo=None, project=None, post_comment=False, prompt_name=None, *
     # 3. Запускаем основную функцию ревью с параметрами таски.
     from auto_git_review import review
 
-    return review.run_review(repo=repo, project=project, post_comment=post_comment, prompt_name=prompt_name)
+    return review.run_review(repo=repo, project=project, post_comment=post_comment, prompt_name=prompt_name, max_batches=max_batches)
 
 
 with DAG(
@@ -201,6 +206,7 @@ with DAG(
                 "project": _cfg.get("project"),
                 "post_comment": _cfg.get("post_comment", False),
                 "prompt_name": _cfg.get("prompt_name"),
+                "max_batches": DC.MAX_BATCHES,
             },
             executor_config=DC.RESOURCE_CONFIG,
         )

@@ -274,14 +274,16 @@ def _merge_results(parsed_list: list) -> dict:
     return {"verdict": verdict, "summary": summary, "comments": comments}
 
 
-def run_review(log=None, repo: str = None, project: str = None, post_comment: bool = False, prompt_name: str = None):
+def run_review(log=None, repo: str = None, project: str = None, post_comment: bool = False, prompt_name: str = None, max_batches: int = 20):
     """Главная функция: ревью всех открытых PR. Подробно логирует каждый шаг.
 
     Параметры (передаются из таски Airflow):
       - repo         — имя репозитория в ALM (если None — из настроек/config.py);
       - project      — имя проекта ALM (если None — из настроек/config.py);
       - post_comment — отправлять ли резюме комментарием в PR;
-      - prompt_name  — файл промпта в prompts/ (для разных типов репозиториев).
+      - prompt_name  — файл промпта в prompts/ (для разных типов репозиториев);
+      - max_batches  — максимум батчей на один PR; при превышении полный анализ
+                       не выполняется, возвращается общее резюме.
     """
     log = log or logger
 
@@ -376,41 +378,58 @@ def run_review(log=None, repo: str = None, project: str = None, post_comment: bo
             log.warning("    Изменения не получены — ревью пропущено.")
             continue
 
-        log.info("  Шаг 6: вызываю LLM (%s) по каждому батчу...", settings.llm_model)
-        parsed_batches = []
-        for bi, batch in enumerate(batches, start=1):
-            files_text = "\n".join(batch)
-            messages = [
-                {
-                    "role": "user",
-                    "content": render_prompt(
-                        prompt_template,
-                        work_item=work_items_text,
-                        files=files_text,
-                    ),
-                }
-            ]
-            try:
-                response = llm.chat(messages)
-                content = response["content"]
-            except Exception as exc:
-                log.warning("    Батч %d/%d: ошибка вызова LLM: %s", bi, len(batches), exc)
+        if len(batches) > max_batches:
+            # Тяжёлый случай (напр. тысячи файлов): не гоняем сотни батчей через LLM,
+            # формируем общее резюме с числом файлов и пометкой «нужно ручное ревью».
+            log.warning(
+                "    Слишком большой PR: %d файлов -> %d батчей (лимит %d) — полный анализ невозможен.",
+                len(sections), len(batches), max_batches,
+            )
+            parsed = {
+                "verdict": "comment",
+                "summary": (
+                    f"В PR изменено {len(sections)} файлов — объём слишком велик для "
+                    f"полного автоматического анализа (превышен лимит батчей: "
+                    f"{len(batches)} > {max_batches}). Требуется ручное ревью."
+                ),
+                "comments": [],
+            }
+        else:
+            log.info("  Шаг 6: вызываю LLM (%s) по каждому батчу...", settings.llm_model)
+            parsed_batches = []
+            for bi, batch in enumerate(batches, start=1):
+                files_text = "\n".join(batch)
+                messages = [
+                    {
+                        "role": "user",
+                        "content": render_prompt(
+                            prompt_template,
+                            work_item=work_items_text,
+                            files=files_text,
+                        ),
+                    }
+                ]
+                try:
+                    response = llm.chat(messages)
+                    content = response["content"]
+                except Exception as exc:
+                    log.warning("    Батч %d/%d: ошибка вызова LLM: %s", bi, len(batches), exc)
+                    continue
+                log.info("    Батч %d/%d: ответ LLM (%d символов)", bi, len(batches), len(content))
+                parsed = _parse_json_response(content)
+                if parsed:
+                    parsed_batches.append(parsed)
+                else:
+                    log.warning("    Батч %d/%d: не удалось разобрать JSON-ответ, сырой текст:", bi, len(batches))
+                    log.warning("%s", content[:1000])
+
+            log.info("  Шаг 7: агрегирую результаты батчей...")
+            if not parsed_batches:
+                log.warning("    Ни один батч не дал разобранный результат — ревью не сформировано.")
+                results.append({"pr_id": pr_id, "verdict": "parse_error"})
                 continue
-            log.info("    Батч %d/%d: ответ LLM (%d символов)", bi, len(batches), len(content))
-            parsed = _parse_json_response(content)
-            if parsed:
-                parsed_batches.append(parsed)
-            else:
-                log.warning("    Батч %d/%d: не удалось разобрать JSON-ответ, сырой текст:", bi, len(batches))
-                log.warning("%s", content[:1000])
+            parsed = _merge_results(parsed_batches)
 
-        log.info("  Шаг 7: агрегирую результаты батчей...")
-        if not parsed_batches:
-            log.warning("    Ни один батч не дал разобранный результат — ревью не сформировано.")
-            results.append({"pr_id": pr_id, "verdict": "parse_error"})
-            continue
-
-        parsed = _merge_results(parsed_batches)
         verdict = parsed.get("verdict", "?")
         summary = parsed.get("summary", "")
         comments = parsed.get("comments", [])
