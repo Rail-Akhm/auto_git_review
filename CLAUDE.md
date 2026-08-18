@@ -11,23 +11,40 @@ Azure DevOps Server (on-prem ALM).
 1. Находит все открытые PR в целевом репозитории ALM.
 2. Для каждого PR собирает изменения (diff) по всем затронутым файлам.
 3. Для каждого изменённого файла дополнительно подтягивает контекст — 5
-   последних завершённых PR, затрагивавших этот же файл (их diff +
-   commit-сообщения), чтобы LLM понимала историю изменений и сложившиеся
-   паттерны кода.
+   последних коммитов, затрагивавших этот же файл (commit-сообщения), чтобы LLM
+   понимала историю изменений и сложившиеся паттерны кода.
 4. Передаёт всё это локальной LLM (через LiteLLM-шлюз, OpenAI-совместимый
    интерфейс) с запросом оценить корректность изменений.
 5. Возвращает структурированный результат ревью в JSON, который конвертируется
-   в markdown-отчёт и (опционально) в комментарии к PR прямо в ALM.
+   в markdown-отчёт и (опционально) в комментарий к PR прямо в ALM.
 
-### Этапы
+### Текущее состояние (реализовано)
 
-- **Этап 1 (сейчас).** Прототип в Apache Airflow: ДАГ с одной таской запускает
-  основную функцию ревью всех открытых PR. Реализовано: сбор diff PR
-  (`diffs/commits` между target и source) и контекст истории каждого файла
-  (`commits` по `searchCriteria.itemPath`). Комментарии в PR — следующая фаза.
-- **Этап 2 (в перспективе).** Сервис, периодически опрашивающий наличие
-  открытых PR (планировщик + dedup по уже отревьюенным), позже — мгновенная
-  реакция через Service Hook (webhook).
+- Сбор diff PR и контекста истории каждого файла.
+- Для изменённых файлов в промпт кладётся и unified diff, и **полное новое
+  содержимое** — модель видит весь файл, а не только фрагменты (иначе пишет
+  «нет всего кода»).
+- **Батчевое ревью:** большие PR режутся на батчи (~8–10k токенов,
+  `MAX_BATCH_CHARS`), каждый ревьюится отдельным вызовом LLM, результаты
+  агрегируются в один итог (verdict по приоритету
+  `request_changes > comment > approve`, summary склейкой «Часть N», comments —
+  объединением).
+- **Лимит батчей** (`max_batches=20`, вынесен в `DAGConfiguration.MAX_BATCHES`):
+  слишком тяжёлые PR (напр. тысячи файлов) не гоняются через LLM — формируется
+  общее резюме с числом файлов и пометкой «требуется ручное ревью».
+- **Dedup:** проверка маркера `COMMENT_MARKER = "auto_git_review"` в комментариях
+  PR **до** вызова LLM (не тратим вызовы модели на уже отревьюенные PR). Маркер,
+  а не автор: владелец PAT — реальный пользователь, у которого могут быть и
+  собственные комментарии.
+- **Постинг** результата комментарием в PR (один общий thread, без привязки к
+  конкретной строке файла).
+- **Мульти-проектность и мульти-репозиторность:** репозитории в разных проектах
+  ALM, свой промпт под каждый тип кодовой базы.
+
+### Этапы (в перспективе)
+
+- **Этап 2.** Сервис, периодически опрашивающий наличие открытых PR
+  (планировщик), позже — мгновенная реакция через Service Hook (webhook).
 
 ### Зачем (ценность)
 
@@ -43,13 +60,22 @@ Azure DevOps Server (on-prem ALM).
 | Параметр | Значение |
 |---|---|
 | Платформа | Azure DevOps Server 2020 Update 1.2 (on-prem) |
-| Base URL | `https://alm-itsk.gazprom-neft.local:8080/TFS/GPN/U200001871_mkhdbrd/` |
-| Проект | `U200001871_mkhdbrd` |
-| Репозиторий | `U200001871_mkhdbrd_greenplum` (Greenplum) |
+| Base URL (коллекция) | `https://alm-itsk.gazprom-neft.local:8080/TFS/GPN` |
 | API version | `6.1-preview` |
 | Аутентификация | PAT, `HTTPBasicAuth("", pat)` |
 | TLS | `verify=False` (самоподписанный сертификат) |
 | Права токена | чтение + запись |
+
+Проекты и репозитории (каждый — отдельная таска ДАГа со своим промптом):
+
+| Проект | Репозиторий | Тип кодовой базы | Промпт |
+|---|---|---|---|
+| `U200001871_mkhdbrd` | `U200001871_mkhdbrd_greenplum` | Greenplum SQL | `review_prompt_greenplum.md` |
+| `U200001871_mkhdbrd` | `U200001871_mkhdbrd_razum` | Airflow ETL | `review_prompt_airflow_etl.md` |
+| `dmpdwh` | `dp_rid_airflow_dag` | Airflow (оркестрация Plus7Formit) | `review_prompt_airflow_orchestration.md` |
+| `dmpdwh` | `dp_rid_adqm` | ClickHouse SQL | `review_prompt_clickhouse.md` |
+| `dmpdwh` | `dp_rid_adb` | Greenplum SQL | `review_prompt_greenplum.md` |
+| `dmpdwh` | `dp_rid_postgres` | PostgreSQL SQL | `review_prompt_postgres.md` |
 
 ### LLM (LiteLLM-шлюз)
 
@@ -67,24 +93,34 @@ Azure DevOps Server (on-prem ALM).
 
 - **Язык:** Python 3.10+.
 - **HTTP:** `requests`, `verify=False` для ALM и LLM.
-- **Конфигурация:** переменные окружения (`AZURE_DEVOPS_URL`, `AZURE_DEVOPS_PAT`,
-  `LLM_URL`, `LLM_API_KEY`, `LLM_MODEL`, `VERIFY_SSL`). В Airflow они подставляются
-  из Connections `api_git` (host/port/PAT) и `llm_server` (host/port/LLM-ключ);
-  несекретные URL-дефолты заданы в `config.py`.
-- **Клиент LLM:** тонкая обёртка над OpenAI-совместимым endpoint; модель
-  выносится в конфиг, чтобы менять её без правки кода.
+- **Конфигурация:** переменные окружения (`AZURE_DEVOPS_URL`, `AZURE_DEVOPS_PROJECT`,
+  `AZURE_DEVOPS_PAT`, `LLM_URL`, `LLM_API_KEY`, `LLM_MODEL`, `POST_COMMENTS`,
+  `VERIFY_SSL`). В Airflow они подставляются из Connections `api_git` (host/port/PAT)
+  и `llm_server` (host/port/LLM-ключ); несекретные URL-дефолты заданы в `config.py`.
+- **Разделение URL коллекции и проекта:** `azure_url` — база коллекции (без проекта),
+  `azure_project` — имя проекта. Git-эндпоинты project-scoped
+  (`/{collection}/{project}/_apis/...`), WIT — коллекционные (`/_apis/wit/...`).
+- **Клиент LLM:** тонкая обёртка над OpenAI-совместимым endpoint; модель выносится
+  в конфиг, чтобы менять её без правки кода.
 - **Модель:** основная — `qwen3:latest`.
-- **Промпты:** лежат отдельно в `loader/src/auto_git_review/prompts/*.md`
-  (свой промпт под каждый тип кодовой базы — Greenplum, ClickHouse, Postgres,
-  Airflow ETL, оркестрация; легко править без правки кода). В промпт включается
-  описание связанного work item.
-- **Результат ревью:** JSON (файл → комментарии по строкам + общий вердикт).
-- **Оркестрация:** Apache Airflow. Прототип ДАГа в
-  `dags/auto_git_review/auto_git_review_dag.py` запускает основную функцию
-  `review.run_review()` в одной таске PythonOperator с подробным логированием.
-  Адреса и секреты (PAT, ключ LLM) берутся из Airflow Connections
-  `api_git` (host/port/password=PAT) и `llm_server` (host/port/password=LLM-ключ)
-  через `BaseHook.get_connection()`.
+- **Промпты:** лежат отдельно в `loader/src/auto_git_review/prompts/*.md` (свой
+  промпт под каждый тип кодовой базы; легко править без правки кода). В промпт
+  включается описание связанного work item. Плейсхолдеры `[[WORK_ITEM]]` и
+  `[[FILES]]` подставляются через `render_prompt()`.
+- **Результат ревью:** JSON (`verdict` + `summary` + `comments[]`), агрегируется по
+  батчам и конвертируется в markdown-комментарий к PR.
+- **Ограничения размера (защита контекста ~30k токенов):**
+  - `MAX_CHANGE_CHARS = 12000` — полное содержимое одного файла;
+  - `MAX_DIFF_CHARS = 2000` — блок изменённых строк (diff);
+  - `MAX_BATCH_CHARS = 30000` — суммарный размер одного батча (~8–10k токенов);
+  - `MAX_BATCHES = 20` — максимум батчей на PR (в `DAGConfiguration` ДАГа).
+- **Dedup:** по маркеру `COMMENT_MARKER = "auto_git_review"` в тексте комментария
+  (не по автору). Проверка — до вызова LLM.
+- **Оркестрация:** Apache Airflow. ДАГ `dags/prj_brddwh/auto_git_review_dag.py`:
+  одна таска `PythonOperator` на каждый репозиторий из `DAGConfiguration.REPOSITORIES`.
+  Адреса и секреты (PAT, ключ LLM) берутся из Connections `api_git` / `llm_server`
+  через `BaseHook.get_connection()` и раскладываются в `os.environ` функцией
+  `_apply_connections()`.
 
 ## Рабочий процесс и деплой
 
@@ -104,9 +140,10 @@ Azure DevOps Server (on-prem ALM).
   корректности кода, без контекста.
 - Критерии корректности: логические ошибки, корректность SQL (Greenplum),
   производительность, безопасность, соответствие стилю.
-- v1: по умолчанию только отчёт; флаг `--post` пишет комментарии в PR.
-- Сервис: планировщик (cron), позже Service Hook.
+- Комментарий постится одним общим thread к PR (без привязки к конкретной строке
+  файла) — построчные комментарии (`threadContext`) не реализованы.
 
 ## Открытые вопросы
 
-- Схема записи комментариев в PR и dedup — уточнить на Фазе 7.
+- Мгновенная реакция через Service Hook (webhook) вместо планировщика — Фаза 2.
+- (Опционально) построчные комментарии к файлам/строкам вместо одного общего резюме.
