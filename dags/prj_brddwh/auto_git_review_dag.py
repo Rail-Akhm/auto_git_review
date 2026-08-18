@@ -16,7 +16,7 @@ from airflow.hooks.base import BaseHook
 
 
 class DAGConfiguration:
-    DAG_NAME = "SERV_auto_git_review"
+    DAG_NAME = "SERV__auto_git_review"
     DAG_DESCRIPTION = "Автоматическое ревью открытых PR в Azure DevOps Server (Greenplum)"
     DAG_MAX_ACTIVE_TASKS = 1
 
@@ -26,7 +26,7 @@ class DAGConfiguration:
 
     # Пути, которые не помещаются в стандартные поля Connection (host/port/login/password)
     ALM_BASE_PATH = "/TFS/GPN/U200001871_mkhdbrd"
-    LLM_PATH = "/chat/completions"
+    LLM_PATH = "/chat/completions"  # префикс /v1 задан в поле host коннектора llm_server
 
     DAG_DEFAULT_ARGS = {
         "owner": "airflow",
@@ -123,8 +123,8 @@ def run_wrapper(**kwargs):
 
 
 with DAG(
-    "SERV__auto_git_review",
-    description="Автоматическое ревью открытых PR в Azure DevOps Server (Greenplum)"  ,
+    dag_id=DC.DAG_NAME,
+    description=DC.DAG_DESCRIPTION,
     schedule_interval=None,
     tags=["review", "git", "llm", "auto_git_review"],
     max_active_runs=1,
