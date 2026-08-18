@@ -23,7 +23,7 @@ reviews/
 # Корпоративный ETL-фреймворк (копируется вручную; в репозиторий не коммитится).
 # Внутри этих папок живёт только проект auto_git_review — его включаем обратно.
 dags/*
-!dags/auto_git_review/
+!dags/prj_brddwh/
 
 loader/*
 !loader/src/
