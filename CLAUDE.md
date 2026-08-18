@@ -21,8 +21,8 @@ Azure DevOps Server (on-prem ALM).
 
 ### Этапы
 
-- **Этап 1 (сейчас).** Простой Python-скрипт (CLI): запустил → получил review
-  всех открытых PR выбранного репозитория в виде отчёта.
+- **Этап 1 (сейчас).** Прототип в Apache Airflow: ДАГ с одной таской запускает
+  основную функцию ревью всех открытых PR (diff/комментарии добавляются по фазам).
 - **Этап 2 (в перспективе).** Сервис, периодически опрашивающий наличие
   открытых PR (планировщик + dedup по уже отревьюенным), позже — мгновенная
   реакция через Service Hook (webhook).
@@ -65,16 +65,34 @@ Azure DevOps Server (on-prem ALM).
 
 - **Язык:** Python 3.10+.
 - **HTTP:** `requests`, `verify=False` для ALM и LLM.
-- **Конфигурация:** `.env` (URL, модель, PAT, ключ LLM). Секреты не коммитятся
-  (`.env` в `.gitignore`). Есть `.env.example` с заполнителями.
+- **Конфигурация:** переменные окружения (`AZURE_DEVOPS_URL`, `AZURE_DEVOPS_PAT`,
+  `LLM_URL`, `LLM_API_KEY`, `LLM_MODEL`, `VERIFY_SSL`). В Airflow они подставляются
+  из Connections `api_git` (host/port/PAT) и `llm_server` (host/port/LLM-ключ);
+  несекретные URL-дефолты заданы в `config.py`.
 - **Клиент LLM:** тонкая обёртка над OpenAI-совместимым endpoint; модель
   выносится в конфиг, чтобы менять её без правки кода.
 - **Модель:** основная — `qwen3:latest`.
-- **Промпт:** лежит отдельно в `prompts/review_prompt.md` (легко править без
+- **Промпт:** лежит отдельно в
+  `loader/src/auto_git_review/prompts/review_prompt.md` (легко править без
   правки кода). В промпт включается описание связанного work item.
 - **Результат ревью:** JSON (файл → комментарии по строкам + общий вердикт).
-- **Среда запуска:** сервер с Python (1 CPU / 2 GB RAM), без специфического
-  SDK — обычный CLI-скрипт.
+- **Оркестрация:** Apache Airflow. Прототип ДАГа в
+  `dags/auto_git_review/auto_git_review_dag.py` запускает основную функцию
+  `review.run_review()` в одной таске PythonOperator с подробным логированием.
+  Адреса и секреты (PAT, ключ LLM) берутся из Airflow Connections
+  `api_git` (host/port/password=PAT) и `llm_server` (host/port/password=LLM-ключ)
+  через `BaseHook.get_connection()`.
+
+## Рабочий процесс и деплой
+
+- Разработка ведётся в GitHub (`Rail-Akhm/auto_git_review`) — только для удобства.
+- Корпоративный контур **не имеет доступа к GitHub**: `git clone`/`git pull`
+  на сервере недоступны.
+- Код переносится на сервер **вручную** (копированием файлов) + настройка
+  Airflow Connections `api_git` и `llm_server` в UI.
+- В инструкциях по запуску на сервере не предлагать `git pull`.
+- ДАГи Airflow кладутся в `dags/` (dags_folder), код проекта — в
+  `loader/src/auto_git_review/`.
 
 ## Предположения (подтвердить по ходу)
 

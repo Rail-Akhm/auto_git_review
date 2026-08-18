@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
+PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 def load_prompt(name: str = "review_prompt.md") -> str:
