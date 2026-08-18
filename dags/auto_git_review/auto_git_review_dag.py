@@ -16,7 +16,7 @@ from airflow.hooks.base import BaseHook
 
 
 class DAGConfiguration:
-    DAG_NAME = "U200001871_GP-auto_git_review-REVIEW"
+    DAG_NAME = "SERV_auto_git_review"
     DAG_DESCRIPTION = "Автоматическое ревью открытых PR в Azure DevOps Server (Greenplum)"
     DAG_MAX_ACTIVE_TASKS = 1
 
