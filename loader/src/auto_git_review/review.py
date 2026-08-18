@@ -214,11 +214,12 @@ def _build_files_context(alm: AlmClient, changes: list, source_commit: str, targ
     return "\n".join(sections) if sections else "(изменения не получены)"
 
 
-def run_review(log=None, repo: str = None, post_comment: bool = False, prompt_name: str = None):
+def run_review(log=None, repo: str = None, project: str = None, post_comment: bool = False, prompt_name: str = None):
     """Главная функция: ревью всех открытых PR. Подробно логирует каждый шаг.
 
     Параметры (передаются из таски Airflow):
       - repo         — имя репозитория в ALM (если None — из настроек/config.py);
+      - project      — имя проекта ALM (если None — из настроек/config.py);
       - post_comment — отправлять ли резюме комментарием в PR;
       - prompt_name  — файл промпта в prompts/ (для разных типов репозиториев).
     """
@@ -230,12 +231,15 @@ def run_review(log=None, repo: str = None, post_comment: bool = False, prompt_na
     settings = get_settings()
     if repo:
         settings = replace(settings, azure_repo=repo)
+    if project:
+        settings = replace(settings, azure_project=project)
     if post_comment:
         settings = replace(settings, post_comments=True)
-    prompt_name = prompt_name or "review_prompt.md"
+    prompt_name = prompt_name or "review_prompt_greenplum.md"
 
     log.info("Настройки загружены:")
     log.info("  ALM URL      : %s", settings.azure_url)
+    log.info("  Проект       : %s", settings.azure_project)
     log.info("  Репозиторий  : %s", settings.azure_repo)
     log.info("  LLM модель   : %s", settings.llm_model)
     log.info("  LLM endpoint : %s", settings.llm_url)

@@ -14,12 +14,24 @@ class AlmClient:
         self.session.verify = self.settings.verify_ssl
 
     def _url(self, path: str) -> str:
+        # Git-эндпоинты — project-scoped: /{collection}/{project}/_apis/...
+        return f"{self.settings.azure_url}/{self.settings.azure_project}/{path.lstrip('/')}"
+
+    def _url_collection(self, path: str) -> str:
+        # Коллекционные эндпоинты (без проекта в пути), напр. WIT.
         return f"{self.settings.azure_url}/{path.lstrip('/')}"
 
     def _get(self, path: str, params=None) -> dict:
         p = dict(params or {})
         p.setdefault("api-version", self.settings.api_version)
         resp = self.session.get(self._url(path), params=p, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _get_collection(self, path: str, params=None) -> dict:
+        p = dict(params or {})
+        p.setdefault("api-version", self.settings.api_version)
+        resp = self.session.get(self._url_collection(path), params=p, timeout=60)
         resp.raise_for_status()
         return resp.json()
 
@@ -50,7 +62,8 @@ class AlmClient:
         )
 
     def get_work_item(self, work_item_id: int) -> dict:
-        return self._get(f"_apis/wit/workitems/{work_item_id}")
+        # WIT — коллекционный эндпоинт (не привязан к проекту).
+        return self._get_collection(f"_apis/wit/workitems/{work_item_id}")
 
     def get_pr_changes(self, source_commit: str, target_commit: str, repo: str = None) -> dict:
         """Низкоуровневый diff между двумя коммитами (diffs/commits).

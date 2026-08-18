@@ -17,7 +17,10 @@ if not VERIFY_SSL:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Корпоративные константы (НЕ секреты) — дефолты, чтобы задавать только секреты.
-AZURE_URL_DEFAULT = "https://alm-itsk.gazprom-neft.local:8080/TFS/GPN/U200001871_mkhdbrd"
+# azure_url — база коллекции (БЕЗ проекта); проект задаётся отдельно (azure_project),
+# т.к. репозитории могут лежать в разных проектах ALM.
+AZURE_URL_DEFAULT = "https://alm-itsk.gazprom-neft.local:8080/TFS/GPN"
+AZURE_PROJECT_DEFAULT = "U200001871_mkhdbrd"
 AZURE_REPO_DEFAULT = "U200001871_mkhdbrd_greenplum"
 LLM_URL_DEFAULT = "https://spb99akl-dgx02.gazprom-neft.local/v1/chat/completions"
 
@@ -25,6 +28,7 @@ LLM_URL_DEFAULT = "https://spb99akl-dgx02.gazprom-neft.local/v1/chat/completions
 @dataclass(frozen=True)
 class Settings:
     azure_url: str
+    azure_project: str
     azure_pat: str
     azure_repo: str
     api_version: str
@@ -42,6 +46,7 @@ def _env_bool(name: str, default: str = "false") -> bool:
 def get_settings() -> Settings:
     return Settings(
         azure_url=os.environ.get("AZURE_DEVOPS_URL", AZURE_URL_DEFAULT).rstrip("/"),
+        azure_project=os.environ.get("AZURE_DEVOPS_PROJECT", AZURE_PROJECT_DEFAULT),
         azure_pat=os.environ.get("AZURE_DEVOPS_PAT", "").strip(),
         azure_repo=os.environ.get("AZURE_DEVOPS_REPO", AZURE_REPO_DEFAULT),
         api_version=os.environ.get("AZURE_DEVOPS_API_VERSION", "6.1-preview"),

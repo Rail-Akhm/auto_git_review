@@ -5,7 +5,7 @@ from pathlib import Path
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 
-def load_prompt(name: str = "review_prompt.md") -> str:
+def load_prompt(name: str = "review_prompt_greenplum.md") -> str:
     return (PROMPT_DIR / name).read_text(encoding="utf-8")
 
 

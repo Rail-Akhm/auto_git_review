@@ -74,9 +74,10 @@ Azure DevOps Server (on-prem ALM).
 - **Клиент LLM:** тонкая обёртка над OpenAI-совместимым endpoint; модель
   выносится в конфиг, чтобы менять её без правки кода.
 - **Модель:** основная — `qwen3:latest`.
-- **Промпт:** лежит отдельно в
-  `loader/src/auto_git_review/prompts/review_prompt.md` (легко править без
-  правки кода). В промпт включается описание связанного work item.
+- **Промпты:** лежат отдельно в `loader/src/auto_git_review/prompts/*.md`
+  (свой промпт под каждый тип кодовой базы — Greenplum, ClickHouse, Postgres,
+  Airflow ETL, оркестрация; легко править без правки кода). В промпт включается
+  описание связанного work item.
 - **Результат ревью:** JSON (файл → комментарии по строкам + общий вердикт).
 - **Оркестрация:** Apache Airflow. Прототип ДАГа в
   `dags/auto_git_review/auto_git_review_dag.py` запускает основную функцию
