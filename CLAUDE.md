@@ -68,10 +68,16 @@ Azure DevOps Server (on-prem ALM).
 
 `auto_git_review_research/auto_git_review_research.ipynb` — самодокументирующий
 разбор пайплайна по аналогии с `similarity_search/edm_research.ipynb`: весь
-production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`) встроен
-в клетки дословно, вокруг — markdown-нарратив и проверка инвариантов H1–H4.
-Назначение — демонстрация проекта (комиссия / другие команды). Файл
-самодостаточен (генератора нет, правится напрямую).
+production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`,
+`eval.py`, `monitoring.py`) встроен в клетки дословно, вокруг — markdown-нарратив,
+проверка инвариантов H1–H4, демо мониторинга прогона (раздел 3.3) и оценки
+качества (раздел 3.5). Назначение — демонстрация проекта (комиссия / другие
+команды) и подача на валидацию. Файл самодостаточен (генератора нет, правится
+напрямую).
+
+Вместе с ноутбуком в папку `auto_git_review_research/` для подачи на валидацию
+скопированы `README.md`, `requirements*.txt`, `pytest.ini`, `prompts/` и `tests/`
+(unit-тесты и пример eval-датасета) — полный комплект материалов для рецензента.
 
 **Все адреса ALM/LLM и имена проектов/репозиториев в ноутбуке и его
 `.env.example` — примеры** (`example.local`, `ExampleProject1`, …). Реальные

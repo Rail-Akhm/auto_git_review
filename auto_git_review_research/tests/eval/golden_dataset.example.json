@@ -1,0 +1,26 @@
+{
+  "_comment": "Пример схемы eval-датасета (golden set). Все значения — примеры, не реальные корпоративные данные. Для прогона замените на реальные кейсы с эталонными вердиктами эксперта.",
+  "cases": [
+    {
+      "id": "case-001",
+      "description": "Добавление нового SQL-файла с корректным SELECT",
+      "prompt_name": "review_prompt_greenplum.md",
+      "verdict_expected": "approve",
+      "source": {"repo": "example_repo", "project": "ExampleProject", "pr_id": 1001}
+    },
+    {
+      "id": "case-002",
+      "description": "Изменение логики ETL с потенциальной ошибкой фильтрации",
+      "prompt_name": "review_prompt_airflow_etl.md",
+      "verdict_expected": "request_changes",
+      "source": {"repo": "example_repo", "project": "ExampleProject", "pr_id": 1002}
+    },
+    {
+      "id": "case-003",
+      "description": "Небольшое форматирование, замечаний нет, но есть пожелание",
+      "prompt_name": "review_prompt_postgres.md",
+      "verdict_expected": "comment",
+      "source": {"repo": "example_repo", "project": "ExampleProject", "pr_id": 1003}
+    }
+  ]
+}
