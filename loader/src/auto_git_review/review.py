@@ -3,11 +3,13 @@
 import difflib
 import json
 import logging
+import time
 from dataclasses import replace
 
 from .alm import AlmClient
 from .config import get_settings
 from .llm import LlmClient
+from .monitoring import emit_summary, summarize
 from .prompt import load_prompt, render_prompt
 
 logger = logging.getLogger("auto_git_review")
@@ -128,7 +130,11 @@ def _already_reviewed(alm: AlmClient, pr_id: int) -> bool:
     except Exception as exc:
         # При ошибке проверки не можем гарантировать отсутствие дубля — пропускаем
         # постинг (лучше не отправить, чем отправить второй раз).
-        logger.warning("Не удалось проверить комментарии PR #%s: %s — пропускаю отправку", pr_id, exc)
+        logger.warning(
+            "Не удалось проверить комментарии PR #%s: %s — пропускаю отправку",
+            pr_id,
+            exc,
+        )
         return True
 
     for thread in threads:
@@ -186,7 +192,9 @@ def _format_history(commits: list) -> str:
     return "\n".join(lines)
 
 
-def _build_file_section(alm: AlmClient, change: dict, source_commit: str, target_commit: str) -> str:
+def _build_file_section(
+    alm: AlmClient, change: dict, source_commit: str, target_commit: str
+) -> str:
     """Контекст одного изменённого файла: история + полное содержимое/изменения."""
     change_type = change.get("changeType", "edit")
     item = change.get("item") or {}
@@ -224,7 +232,9 @@ def _build_file_section(alm: AlmClient, change: dict, source_commit: str, target
     )
 
 
-def _build_file_sections(alm: AlmClient, changes: list, source_commit: str, target_commit: str) -> list:
+def _build_file_sections(
+    alm: AlmClient, changes: list, source_commit: str, target_commit: str
+) -> list:
     """Список секций контекста по изменённым файлам (tree-объекты пропускаются)."""
     sections = []
     for change in changes:
@@ -274,7 +284,213 @@ def _merge_results(parsed_list: list) -> dict:
     return {"verdict": verdict, "summary": summary, "comments": comments}
 
 
-def run_review(log=None, repo: str = None, project: str = None, post_comment: bool = False, prompt_name: str = None, max_batches: int = 20):
+def _collect_pr_changes(alm: AlmClient, pr_id: int, log) -> tuple:
+    """Возвращает (source_commit, target_commit, changes) для PR.
+
+    changes — список изменённых файлов последней итерации (changeEntries).
+    При отсутствии коммитов или ошибке список changes остаётся пустым.
+    """
+    detail = alm.get_pull_request(pr_id)
+    src_commit = detail.get("lastMergeSourceCommit", {}).get("commitId")
+    tgt_commit = detail.get("lastMergeTargetCommit", {}).get("commitId")
+    log.info("    lastMergeSourceCommit: %s", src_commit)
+    log.info("    lastMergeTargetCommit: %s", tgt_commit)
+
+    changes = []
+    if not src_commit or not tgt_commit:
+        log.warning("    Нет коммитов для diff, изменения не собраны.")
+        return src_commit, tgt_commit, changes
+
+    try:
+        iterations = alm.get_pr_iterations(pr_id).get("value", [])
+        if iterations:
+            last_iteration = max(it["id"] for it in iterations)
+            changes = alm.get_pr_iteration_changes(pr_id, last_iteration).get(
+                "changeEntries", []
+            )
+    except Exception as exc:
+        log.warning("    Не удалось получить список файлов PR #%s: %s", pr_id, exc)
+    return src_commit, tgt_commit, changes
+
+
+def _review_pr_batches(
+    llm: LlmClient, prompt_template: str, batches: list, work_items_text: str, log
+) -> tuple:
+    """Ревью одного PR по батчам: вызов LLM на каждый батч и агрегация результата.
+
+    Возвращает кортеж (parsed, total_latency_ms, total_tokens):
+      - parsed — итоговый dict (verdict + summary + comments) или None, если ни
+        один батч не дал разобранный JSON-ответ;
+      - total_latency_ms / total_tokens — суммарные метрики вызовов LLM по PR.
+    """
+    parsed_batches = []
+    total_latency_ms = 0
+    total_tokens = 0
+    for bi, batch in enumerate(batches, start=1):
+        files_text = "\n".join(batch)
+        messages = [
+            {
+                "role": "user",
+                "content": render_prompt(
+                    prompt_template,
+                    work_item=work_items_text,
+                    files=files_text,
+                ),
+            }
+        ]
+        try:
+            response = llm.chat(messages)
+            content = response["content"]
+        except Exception as exc:
+            log.warning("    Батч %d/%d: ошибка вызова LLM: %s", bi, len(batches), exc)
+            continue
+        total_latency_ms += response.get("latency_ms", 0)
+        usage = response.get("usage") or {}
+        total_tokens += usage.get("total_tokens", 0)
+        log.info("    Батч %d/%d: ответ LLM (%d символов)", bi, len(batches), len(content))
+        parsed = _parse_json_response(content)
+        if parsed:
+            parsed_batches.append(parsed)
+        else:
+            log.warning(
+                "    Батч %d/%d: не удалось разобрать JSON-ответ, сырой текст:",
+                bi,
+                len(batches),
+            )
+            log.warning("%s", content[:1000])
+
+    log.info(
+        "    Итого по PR: %d батч(ей), latency=%dms, tokens=%d",
+        len(batches),
+        total_latency_ms,
+        total_tokens,
+    )
+
+    if not parsed_batches:
+        return None, total_latency_ms, total_tokens
+    return _merge_results(parsed_batches), total_latency_ms, total_tokens
+
+
+def _review_one_pr(
+    alm: AlmClient,
+    llm: LlmClient,
+    prompt_template: str,
+    pr: dict,
+    settings,
+    log,
+    max_batches: int,
+) -> dict:
+    """Ревью одного PR: сбор контекста, батчевый вызов LLM, постинг комментария.
+
+    Возвращает dict результата либо None, если PR пропущен (dedup / нет изменений).
+    """
+    pr_id = pr["pullRequestId"]
+    title = pr.get("title", "")
+    author = pr.get("createdBy", {}).get("displayName", "?")
+    started = time.monotonic()
+    log.info("-" * 60)
+    log.info("PR #%s «%s» (автор: %s)", pr_id, title, author)
+    log.info("  Ветки: %s -> %s", pr.get("sourceRefName"), pr.get("targetRefName"))
+
+    # Dedup: проверяем наличие нашего комментария ДО запуска LLM — не тратим
+    # вызовы модели на уже отревьюенные PR (только в режиме постинга).
+    if settings.post_comments and _already_reviewed(alm, pr_id):
+        log.info("    Комментарий от бота уже есть — пропускаю PR.")
+        return None
+
+    log.info("  Шаг 2: получаю детали PR #%s...", pr_id)
+    src_commit, tgt_commit, changes = _collect_pr_changes(alm, pr_id, log)
+    log.info("    Изменённых файлов: %d", len(changes))
+
+    log.info("  Шаг 3: получаю связанные work items...")
+    work_items_text = _describe_work_items(alm, pr_id)
+    log.info("    %s", work_items_text.replace("\n", "\n    "))
+
+    log.info("  Шаг 4: собираю контекст файлов и делю на батчи...")
+    sections = _build_file_sections(alm, changes, src_commit, tgt_commit)
+    batches = _chunk_sections(sections)
+    log.info("    Файлов: %d, батчей для LLM: %d", len(sections), len(batches))
+
+    if not batches:
+        log.warning("    Изменения не получены — ревью пропущено.")
+        return None
+
+    llm_latency_ms = 0
+    llm_tokens = 0
+    if len(batches) > max_batches:
+        # Тяжёлый случай (напр. тысячи файлов): не гоняем сотни батчей через LLM,
+        # формируем общее резюме с числом файлов и пометкой «нужно ручное ревью».
+        log.warning(
+            "    Слишком большой PR: %d файлов -> %d батчей (лимит %d) — полный анализ невозможен.",
+            len(sections),
+            len(batches),
+            max_batches,
+        )
+        parsed = {
+            "verdict": "comment",
+            "summary": (
+                f"В PR изменено {len(sections)} файлов — объём слишком велик для "
+                f"полного автоматического анализа (превышен лимит батчей: "
+                f"{len(batches)} > {max_batches}). Требуется ручное ревью."
+            ),
+            "comments": [],
+        }
+    else:
+        log.info("  Шаг 5: вызываю LLM (%s) по каждому батчу...", settings.llm_model)
+        parsed, llm_latency_ms, llm_tokens = _review_pr_batches(
+            llm, prompt_template, batches, work_items_text, log
+        )
+        if parsed is None:
+            log.warning(
+                "    Ни один батч не дал разобранный результат — ревью не сформировано."
+            )
+            return {
+                "pr_id": pr_id,
+                "verdict": "parse_error",
+                "latency_ms": llm_latency_ms,
+                "tokens": llm_tokens,
+            }
+
+    verdict = parsed.get("verdict", "?")
+    summary = parsed.get("summary", "")
+    comments = parsed.get("comments", [])
+    log.info("    Вердикт: %s", verdict)
+    log.info("    Резюме: %s", summary)
+    log.info("    Комментариев: %d", len(comments))
+
+    if settings.post_comments:
+        log.info("    Отправляю резюме в PR как комментарий...")
+        try:
+            comment_text = _format_review_comment(parsed)
+            thread = alm.create_thread_comment(pr_id, comment_text)
+            log.info("    Комментарий создан, thread id=%s", thread.get("id"))
+        except Exception as exc:
+            log.warning("    Не удалось отправить комментарий в PR #%s: %s", pr_id, exc)
+    else:
+        log.info("    Отправка комментариев отключена (POST_COMMENTS=false).")
+
+    log.info(
+        "    PR #%s обработан за %dms (end-to-end)",
+        pr_id,
+        int((time.monotonic() - started) * 1000),
+    )
+    return {
+        "pr_id": pr_id,
+        "verdict": verdict,
+        "comments": comments,
+        "latency_ms": llm_latency_ms,
+        "tokens": llm_tokens,
+    }
+
+
+def run_review(
+    log=None,
+    repo: str = None,
+    project: str = None,
+    post_comment: bool = False,
+    prompt_name: str = None,
+    max_batches: int = 20,
+):
     """Главная функция: ревью всех открытых PR. Подробно логирует каждый шаг.
 
     Параметры (передаются из таски Airflow):
@@ -329,127 +545,14 @@ def run_review(log=None, repo: str = None, project: str = None, post_comment: bo
 
     results = []
     for idx, pr in enumerate(prs, start=1):
-        pr_id = pr["pullRequestId"]
-        title = pr.get("title", "")
-        author = pr.get("createdBy", {}).get("displayName", "?")
-        log.info("-" * 60)
-        log.info("PR %d/%d: #%s «%s» (автор: %s)", idx, len(prs), pr_id, title, author)
-        log.info("  Ветки: %s -> %s", pr.get("sourceRefName"), pr.get("targetRefName"))
-
-        # Dedup: проверяем наличие нашего комментария ДО запуска LLM — не тратим
-        # вызовы модели на уже отревьюенные PR (только в режиме постинга).
-        if settings.post_comments and _already_reviewed(alm, pr_id):
-            log.info("    Комментарий от бота уже есть — пропускаю PR.")
-            continue
-
-        log.info("  Шаг 2: получаю детали PR #%s...", pr_id)
-        detail = alm.get_pull_request(pr_id)
-        src_commit = detail.get("lastMergeSourceCommit", {}).get("commitId")
-        tgt_commit = detail.get("lastMergeTargetCommit", {}).get("commitId")
-        log.info("    lastMergeSourceCommit: %s", src_commit)
-        log.info("    lastMergeTargetCommit: %s", tgt_commit)
-
-        log.info("  Шаг 3: получаю связанные work items...")
-        work_items_text = _describe_work_items(alm, pr_id)
-        log.info("    %s", work_items_text.replace("\n", "\n    "))
-
-        log.info("  Шаг 4: собираю список изменённых файлов PR...")
-        changes = []
-        if not src_commit or not tgt_commit:
-            log.warning("    Нет коммитов для diff, изменения не собраны.")
-        else:
-            try:
-                iterations = alm.get_pr_iterations(pr_id).get("value", [])
-                if iterations:
-                    last_iteration = max(it["id"] for it in iterations)
-                    changes = alm.get_pr_iteration_changes(pr_id, last_iteration).get(
-                        "changeEntries", []
-                    )
-            except Exception as exc:
-                log.warning("    Не удалось получить список файлов PR #%s: %s", pr_id, exc)
-        log.info("    Изменённых файлов: %d", len(changes))
-
-        log.info("  Шаг 5: собираю контекст файлов и делю на батчи...")
-        sections = _build_file_sections(alm, changes, src_commit, tgt_commit)
-        batches = _chunk_sections(sections)
-        log.info("    Файлов: %d, батчей для LLM: %d", len(sections), len(batches))
-
-        if not batches:
-            log.warning("    Изменения не получены — ревью пропущено.")
-            continue
-
-        if len(batches) > max_batches:
-            # Тяжёлый случай (напр. тысячи файлов): не гоняем сотни батчей через LLM,
-            # формируем общее резюме с числом файлов и пометкой «нужно ручное ревью».
-            log.warning(
-                "    Слишком большой PR: %d файлов -> %d батчей (лимит %d) — полный анализ невозможен.",
-                len(sections), len(batches), max_batches,
-            )
-            parsed = {
-                "verdict": "comment",
-                "summary": (
-                    f"В PR изменено {len(sections)} файлов — объём слишком велик для "
-                    f"полного автоматического анализа (превышен лимит батчей: "
-                    f"{len(batches)} > {max_batches}). Требуется ручное ревью."
-                ),
-                "comments": [],
-            }
-        else:
-            log.info("  Шаг 6: вызываю LLM (%s) по каждому батчу...", settings.llm_model)
-            parsed_batches = []
-            for bi, batch in enumerate(batches, start=1):
-                files_text = "\n".join(batch)
-                messages = [
-                    {
-                        "role": "user",
-                        "content": render_prompt(
-                            prompt_template,
-                            work_item=work_items_text,
-                            files=files_text,
-                        ),
-                    }
-                ]
-                try:
-                    response = llm.chat(messages)
-                    content = response["content"]
-                except Exception as exc:
-                    log.warning("    Батч %d/%d: ошибка вызова LLM: %s", bi, len(batches), exc)
-                    continue
-                log.info("    Батч %d/%d: ответ LLM (%d символов)", bi, len(batches), len(content))
-                parsed = _parse_json_response(content)
-                if parsed:
-                    parsed_batches.append(parsed)
-                else:
-                    log.warning("    Батч %d/%d: не удалось разобрать JSON-ответ, сырой текст:", bi, len(batches))
-                    log.warning("%s", content[:1000])
-
-            log.info("  Шаг 7: агрегирую результаты батчей...")
-            if not parsed_batches:
-                log.warning("    Ни один батч не дал разобранный результат — ревью не сформировано.")
-                results.append({"pr_id": pr_id, "verdict": "parse_error"})
-                continue
-            parsed = _merge_results(parsed_batches)
-
-        verdict = parsed.get("verdict", "?")
-        summary = parsed.get("summary", "")
-        comments = parsed.get("comments", [])
-        log.info("    Вердикт: %s", verdict)
-        log.info("    Резюме: %s", summary)
-        log.info("    Комментариев: %d", len(comments))
-
-        if settings.post_comments:
-            log.info("    Отправляю резюме в PR как комментарий...")
-            try:
-                comment_text = _format_review_comment(parsed)
-                thread = alm.create_thread_comment(pr_id, comment_text)
-                log.info("    Комментарий создан, thread id=%s", thread.get("id"))
-            except Exception as exc:
-                log.warning("    Не удалось отправить комментарий в PR #%s: %s", pr_id, exc)
-        else:
-            log.info("    Отправка комментариев отключена (POST_COMMENTS=false).")
-
-        results.append({"pr_id": pr_id, "verdict": verdict, "comments": comments})
+        log.info("PR %d/%d:", idx, len(prs))
+        result = _review_one_pr(
+            alm, llm, prompt_template, pr, settings, log, max_batches
+        )
+        if result is not None:
+            results.append(result)
 
     log.info("=" * 60)
     log.info("ГОТОВО: обработано PR — %d", len(results))
+    emit_summary(log, summarize(results))
     return results

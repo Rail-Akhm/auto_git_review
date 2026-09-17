@@ -7,6 +7,8 @@ from .config import get_settings
 
 
 class AlmClient:
+    """Клиент REST API Azure DevOps Server (on-prem)."""
+
     def __init__(self, settings=None):
         self.settings = settings or get_settings()
         self.session = requests.Session()
@@ -14,14 +16,15 @@ class AlmClient:
         self.session.verify = self.settings.verify_ssl
 
     def _url(self, path: str) -> str:
-        # Git-эндпоинты — project-scoped: /{collection}/{project}/_apis/...
+        """URL project-scoped эндпоинта: /{collection}/{project}/_apis/..."""
         return f"{self.settings.azure_url}/{self.settings.azure_project}/{path.lstrip('/')}"
 
     def _url_collection(self, path: str) -> str:
-        # Коллекционные эндпоинты (без проекта в пути), напр. WIT.
+        """URL коллекционного эндпоинта (без проекта в пути), напр. WIT."""
         return f"{self.settings.azure_url}/{path.lstrip('/')}"
 
     def _get(self, path: str, params=None) -> dict:
+        """GET к project-scoped эндпоинту; добавляет api-version в параметры."""
         p = dict(params or {})
         p.setdefault("api-version", self.settings.api_version)
         resp = self.session.get(self._url(path), params=p, timeout=60)
@@ -29,6 +32,7 @@ class AlmClient:
         return resp.json()
 
     def _get_collection(self, path: str, params=None) -> dict:
+        """GET к коллекционному эндпоинту; добавляет api-version в параметры."""
         p = dict(params or {})
         p.setdefault("api-version", self.settings.api_version)
         resp = self.session.get(self._url_collection(path), params=p, timeout=60)
@@ -52,17 +56,19 @@ class AlmClient:
         )
 
     def get_pull_request(self, pr_id: int, repo: str = None) -> dict:
+        """Детали одного PR (включая lastMergeSourceCommit / lastMergeTargetCommit)."""
         repo = repo or self.settings.azure_repo
         return self._get(f"_apis/git/repositories/{repo}/pullrequests/{pr_id}")
 
     def get_pr_work_items(self, pr_id: int, repo: str = None) -> dict:
+        """Связанные с PR work items."""
         repo = repo or self.settings.azure_repo
         return self._get(
             f"_apis/git/repositories/{repo}/pullrequests/{pr_id}/workitems"
         )
 
     def get_work_item(self, work_item_id: int) -> dict:
-        # WIT — коллекционный эндпоинт (не привязан к проекту).
+        """Детали work item по id (коллекционный эндпоинт WIT)."""
         return self._get_collection(f"_apis/wit/workitems/{work_item_id}")
 
     def get_pr_changes(self, source_commit: str, target_commit: str, repo: str = None) -> dict:
@@ -158,7 +164,9 @@ class AlmClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_file_commits(self, path: str, target_version: str, top: int = 5, repo: str = None) -> dict:
+    def get_file_commits(
+        self, path: str, target_version: str, top: int = 5, repo: str = None
+    ) -> dict:
         """История коммитов, затрагивавших файл path (до версии target_version)."""
         repo = repo or self.settings.azure_repo
         params = {

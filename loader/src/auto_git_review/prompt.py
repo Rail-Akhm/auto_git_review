@@ -6,6 +6,7 @@ PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 def load_prompt(name: str = "review_prompt_greenplum.md") -> str:
+    """Читает текст промпта из prompts/ по имени файла."""
     return (PROMPT_DIR / name).read_text(encoding="utf-8")
 
 

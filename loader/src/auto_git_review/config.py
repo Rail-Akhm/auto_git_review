@@ -27,6 +27,8 @@ LLM_URL_DEFAULT = "https://spb99akl-dgx02.gazprom-neft.local/v1/chat/completions
 
 @dataclass(frozen=True)
 class Settings:
+    """Параметры подключения к ALM и LLM, собранные из переменных окружения."""
+
     azure_url: str
     azure_project: str
     azure_pat: str
@@ -44,6 +46,7 @@ def _env_bool(name: str, default: str = "false") -> bool:
 
 
 def get_settings() -> Settings:
+    """Собирает Settings из переменных окружения (с корпоративными дефолтами)."""
     return Settings(
         azure_url=os.environ.get("AZURE_DEVOPS_URL", AZURE_URL_DEFAULT).rstrip("/"),
         azure_project=os.environ.get("AZURE_DEVOPS_PROJECT", AZURE_PROJECT_DEFAULT),

@@ -40,6 +40,17 @@ Azure DevOps Server (on-prem ALM).
   конкретной строке файла).
 - **Мульти-проектность и мульти-репозиторность:** репозитории в разных проектах
   ALM, свой промпт под каждый тип кодовой базы.
+- **Trace-логи:** `llm.py` возвращает latency и разобранный `usage` (prompt /
+  completion / total токены), логирует промпт и ответ; `review.py` замеряет
+  end-to-end латентность и токены на каждый PR.
+- **Мониторинг прогона:** `monitoring.py` агрегирует результаты в сводные метрики
+  (распределение по вердиктам, суммарная латентность/токены/стоимость) и пишет их
+  одной JSON-строкой `REVIEW_RUN_METRICS` в конце `run_review()`.
+- **Оценка качества (eval):** `eval.py` считает accuracy / Precision / Recall / F1
+  по вердиктам (`approve` / `request_changes` / `comment`) и confusion matrix на
+  golden-датасете; схема датасета — `tests/eval/golden_dataset.example.json`.
+- **Автотесты:** unit-тесты pytest (`tests/`, `pytest.ini`,
+  `requirements-dev.txt`) на чистую логику пайплайна без обращения к ALM/LLM.
 
 ### Этапы (в перспективе)
 

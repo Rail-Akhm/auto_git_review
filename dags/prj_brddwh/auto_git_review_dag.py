@@ -14,13 +14,14 @@
 """
 
 import os
-import airflow
+import sys
 from datetime import timedelta
 
+import airflow
+from airflow.hooks.base import BaseHook
 from airflow.models import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.log.logging_mixin import LoggingMixin
-from airflow.hooks.base import BaseHook
 
 
 class DAGConfiguration:
@@ -143,7 +144,9 @@ def _apply_connections(project=None):
     if not os.environ.get("AZURE_DEVOPS_PAT"):
         os.environ["AZURE_DEVOPS_PAT"] = (conn_alm.get_password() or conn_alm.login or "").strip()
     if not os.environ.get("AZURE_DEVOPS_URL") and conn_alm.host:
-        os.environ["AZURE_DEVOPS_URL"] = _build_url("https", conn_alm.host, conn_alm.port, DC.ALM_COLLECTION_PATH)
+        os.environ["AZURE_DEVOPS_URL"] = _build_url(
+            "https", conn_alm.host, conn_alm.port, DC.ALM_COLLECTION_PATH
+        )
     if project and not os.environ.get("AZURE_DEVOPS_PROJECT"):
         os.environ["AZURE_DEVOPS_PROJECT"] = project
 
@@ -158,10 +161,10 @@ def _apply_connections(project=None):
     log.info("LLM_URL              = %s", os.environ.get("LLM_URL"))
 
 
-def run_wrapper(repo=None, project=None, post_comment=False, prompt_name=None, max_batches=20, **kwargs):
+def run_wrapper(
+    repo=None, project=None, post_comment=False, prompt_name=None, max_batches=20, **kwargs
+):
     # 1. Ищем и добавляем loader/src в sys.path (паттерн проекта).
-    import sys
-
     root = os.path.dirname(os.path.abspath(__file__))
     loader_src = None
     for _ in range(5):
@@ -183,9 +186,17 @@ def run_wrapper(repo=None, project=None, post_comment=False, prompt_name=None, m
     _apply_connections(project)
 
     # 3. Запускаем основную функцию ревью с параметрами таски.
-    from auto_git_review import review
+    # Импорт здесь (а не в начале) обязателен: модуль auto_git_review лежит в
+    # loader/src, который добавляется в sys.path только на шаге 1.
+    from auto_git_review import review  # noqa: E402
 
-    return review.run_review(repo=repo, project=project, post_comment=post_comment, prompt_name=prompt_name, max_batches=max_batches)
+    return review.run_review(
+        repo=repo,
+        project=project,
+        post_comment=post_comment,
+        prompt_name=prompt_name,
+        max_batches=max_batches,
+    )
 
 
 with DAG(
