@@ -205,13 +205,28 @@ PR ноутбук не постит).
 
 ```bash
 pip install -r requirements-dev.txt
-pytest
+pytest        # запускать из корня проекта (там лежит pytest.ini)
 ```
 
-Unit-тесты (`loader/src/auto_git_review/tests/`) покрывают чистую логику пайплайна
-без обращения к ALM/LLM:
-агрегацию батчей и dedup, рендеринг промптов, чтение настроек, сборку URL,
-разбор ответа LLM, расчёт метрик оценки и агрегацию метрик мониторинга.
+Unit-тесты (`loader/src/auto_git_review/tests/`, 41 тест) покрывают чистую логику
+пайплайна без обращения к ALM/LLM: агрегацию батчей и dedup, рендеринг промптов,
+чтение настроек, сборку URL, разбор ответа LLM, расчёт метрик оценки и агрегацию
+метрик мониторинга.
+
+Тесты лежат внутри пакета `auto_git_review` — так они переносятся на сервер вместе
+с рабочим кодом, одним комплектом. `pytest.ini` при этом остаётся в корне
+проекта: он задаёт `pythonpath = loader/src`, без которого тесты не увидят пакет.
+Запускать `pytest` нужно тоже из корня — в pytest 9 пути из `testpaths`
+отсчитываются от каталога запуска, поэтому, например, из `dags/prj_brddwh` не
+соберётся ни один тест.
+
+**Тесты не запускаются ДАГом.** Airflow обходит только `dags_folder` (`dags/`) и
+импортирует оттуда файлы в поисках объектов `DAG`; папка тестов лежит в
+`loader/src/`, поэтому парсер её не открывает. Таска выполняет ровно то, что
+описано в её `python_callable` — `review.run_review()`. Тесты запускаются
+отдельно, вручную (или в CI) на машине, где есть исходники; `pytest` относится к
+зависимостям разработки (`requirements-dev.txt`) и в рабочее окружение воркера не
+входит.
 
 ### Оценка качества (eval)
 
@@ -219,8 +234,8 @@ Unit-тесты (`loader/src/auto_git_review/tests/`) покрывают чис�
 golden-датасете: accuracy, Precision / Recall / F1 по каждому классу вердикта
 (`approve` / `request_changes` / `comment`) и confusion matrix. Схема датасета —
 `loader/src/auto_git_review/tests/eval/golden_dataset.example.json`. Живой прогон с
-моделью выполняется в
-корпоративном контуре: модель подключается через callable `reviewer(case) -> verdict`.
+моделью выполняется в корпоративном контуре: модель подключается через callable
+`reviewer(case) -> verdict`.
 
 ## Конфигурация
 
@@ -245,7 +260,9 @@ golden-датасете: accuracy, Precision / Recall / F1 по каждому �
    - `api_git` — host/port Azure DevOps Server, `password` = PAT;
    - `llm_server` — host/port LiteLLM-шлюза, `password` = LLM API key.
 2. Положите ДАГ `dags/prj_brddwh/auto_git_review_dag.py` в `dags_folder`.
-3. Положите код проекта в `loader/src/auto_git_review/`.
+3. Положите код проекта в `loader/src/auto_git_review/` (папку копируйте целиком,
+   вместе с `tests/` — ДАГ их не запускает, но они переносятся тем же комплектом;
+   см. раздел «Тестирование»).
 4. Опишите репозитории в `DAGConfiguration.REPOSITORIES` — укажите для каждого
    `task_id`, `project`, `repo`, `prompt_name` и `post_comment`.
 
