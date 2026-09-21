@@ -1,7 +1,8 @@
-"""Тесты AlmClient: построение URL и структура тела комментария (без сети)."""
+"""Тесты AlmClient: построение URL, чтение содержимого файлов и тело комментария."""
 
 from unittest.mock import MagicMock
 
+from auto_git_review import alm
 from auto_git_review.alm import AlmClient
 from auto_git_review.config import Settings
 
@@ -58,3 +59,40 @@ def _fake_response(payload):
     resp.json.return_value = payload
     resp.raise_for_status.return_value = None
     return resp
+
+
+def test_decode_content_utf8():
+    assert alm._decode_content("Договоры для проекта".encode("utf-8")) == (
+        "Договоры для проекта"
+    )
+
+
+def test_decode_content_cp1251_fallback():
+    """Файл в CP1251 (старые скрипты репозитория) тоже читается верно."""
+    assert alm._decode_content("Договоры".encode("cp1251")) == "Договоры"
+
+
+def test_decode_content_strips_bom():
+    assert alm._decode_content("Договоры".encode("utf-8-sig")) == "Договоры"
+
+
+def test_decode_content_broken_bytes_does_not_raise():
+    """Мусорные байты не должны ронять ревью — возвращаем текст с заменами."""
+    out = alm._decode_content(b"\xff\xfe\x98\x81 text")
+    assert isinstance(out, str)
+
+
+def test_get_file_content_decodes_utf8_despite_text_plain_header():
+    """Регресс: ALM отдаёт text/plain без charset, а resp.text декодирует
+    байты как ISO-8859-1 и портит русский текст в COMMENT'ах."""
+    client = AlmClient(_settings())
+    raw = "COMMENT ON VIEW v IS 'Договоры';".encode("utf-8")
+    resp = MagicMock()
+    resp.content = raw
+    resp.text = raw.decode("iso-8859-1")  # то, что вернул бы requests
+    resp.raise_for_status.return_value = None
+    client.session.get = MagicMock(return_value=resp)
+
+    assert client.get_file_content("/a.sql", "sha") == (
+        "COMMENT ON VIEW v IS 'Договоры';"
+    )

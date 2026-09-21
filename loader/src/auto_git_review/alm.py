@@ -6,6 +6,22 @@ from requests.auth import HTTPBasicAuth
 from .config import get_settings
 
 
+def _decode_content(raw: bytes) -> str:
+    """Декодирует содержимое файла из ответа ALM.
+
+    ALM отдаёт items с ``Content-Type: text/plain`` без charset, поэтому
+    ``resp.text`` декодирует байты как ISO-8859-1 (так требует RFC 2616 для
+    ``text/*``) и русский текст в COMMENT'ах превращается в «кракозябры».
+    Поэтому декодируем сами: UTF-8, при неудаче — CP1251 (старые файлы).
+    """
+    for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 class AlmClient:
     """Клиент REST API Azure DevOps Server (on-prem)."""
 
@@ -114,7 +130,8 @@ class AlmClient:
         """Сырое содержимое файла ``path`` на версии ``version`` (SHA коммита).
 
         Endpoint ``items?includeContent=true`` для одного файла возвращает ТЕКСТ
-        файла напрямую (не JSON), поэтому здесь читается resp.text, а не resp.json().
+        файла напрямую (не JSON), поэтому здесь читаются байты ответа, а не
+        resp.json(). Кодировку определяем сами — см. :func:`_decode_content`.
         """
         repo = repo or self.settings.azure_repo
         resp = self.session.get(
@@ -129,7 +146,7 @@ class AlmClient:
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.text
+        return _decode_content(resp.content)
 
     def get_threads(self, pr_id: int, repo: str = None) -> dict:
         """Все комментарии (threads) PR. Ответ: {value: [...], count: N}."""
