@@ -50,6 +50,10 @@ Azure DevOps Server (on-prem ALM).
   по вердиктам (`approve` / `request_changes` / `comment`) и confusion matrix на
   golden-датасете; схема датасета —
   `loader/src/auto_git_review/tests/eval/golden_dataset.example.json`.
+  Precision/Recall — one-vs-rest по каждому классу; ошибки неравноценны: FP
+  (`approve` → `request_changes`) бьёт по доверию к боту, FN (`request_changes` →
+  `approve`) пропускает проблему в прод. Разбор метрик — в README, «Метрики
+  качества».
 - **Автотесты:** unit-тесты pytest (`loader/src/auto_git_review/tests/`,
   `pytest.ini`, `requirements-dev.txt`) на чистую логику пайплайна без обращения
   к ALM/LLM. Тесты лежат внутри пакета `auto_git_review` — переносятся на сервер
