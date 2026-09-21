@@ -48,9 +48,12 @@ Azure DevOps Server (on-prem ALM).
   одной JSON-строкой `REVIEW_RUN_METRICS` в конце `run_review()`.
 - **Оценка качества (eval):** `eval.py` считает accuracy / Precision / Recall / F1
   по вердиктам (`approve` / `request_changes` / `comment`) и confusion matrix на
-  golden-датасете; схема датасета — `tests/eval/golden_dataset.example.json`.
-- **Автотесты:** unit-тесты pytest (`tests/`, `pytest.ini`,
-  `requirements-dev.txt`) на чистую логику пайплайна без обращения к ALM/LLM.
+  golden-датасете; схема датасета —
+  `loader/src/auto_git_review/tests/eval/golden_dataset.example.json`.
+- **Автотесты:** unit-тесты pytest (`loader/src/auto_git_review/tests/`,
+  `pytest.ini`, `requirements-dev.txt`) на чистую логику пайплайна без обращения
+  к ALM/LLM. Тесты лежат внутри пакета `auto_git_review` — переносятся на сервер
+  вместе с рабочим кодом (не только в демо-ноутбуке).
 
 ### Этапы (в перспективе)
 
@@ -80,7 +83,7 @@ production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`,
 отчёт по валидации (`[Номер ЗНО C-1101243] Отчет по валидации.pdf`), презентация
 (`Автоматический_ИИ_ревью_Pull_Request_v1.pptx`), `.env.example` и
 `requirements.txt` — полный комплект материалов для рецензента. Отдельные файлы
-`prompts/`, `tests/`, `pytest.ini` и `requirements-dev.txt` в папку подачи **не
+промптов и тестов, `pytest.ini` и `requirements-dev.txt` в папку подачи **не
 выносятся** — они встроены в сам ноутбук.
 
 **Все адреса ALM/LLM и имена проектов/репозиториев в ноутбуке и его

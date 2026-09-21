@@ -59,7 +59,8 @@ LiteLLM-шлюз) оценить корректность изменений. Р
 eval-выборки (oversampling/undersampling).
 
 **Порядок измерения.** Метрики вычисляются на eval-датасете (golden set) — наборе
-PR с эталонными вердиктами — скриптом прогона (см. `tests/eval/`). Замер
+PR с эталонными вердиктами — скриптом прогона (см.
+`loader/src/auto_git_review/tests/eval/`). Замер
 производится при каждом существенном изменении промптов или логики ревью.
 
 ## Как это работает
@@ -141,11 +142,11 @@ PR с эталонными вердиктами — скриптом прого�
 │           ├── eval.py               # Оценка качества на golden-датасете
 │           ├── monitoring.py         # Сводные метрики прогона (latency/tokens/cost)
 │           ├── ALM_API.md            # Документация по REST API
-│           └── prompts/              # Промпты под типы кодовых баз
-├── tests/
-│   ├── test_*.py                     # Unit-тесты (pytest)
-│   └── eval/
-│       └── golden_dataset.example.json  # Пример eval-датасета (схема)
+│           ├── prompts/              # Промпты под типы кодовых баз
+│           └── tests/                # Unit-тесты (pytest)
+│               ├── test_*.py
+│               └── eval/
+│                   └── golden_dataset.example.json  # Пример eval-датасета (схема)
 ├── auto_git_review_research/
 │   ├── auto_git_review_research.ipynb     # Ноутбук-разбор с встроенными 41 unit-тестом
 │   ├── README.md                          # Копия основного README (для подачи на валидацию)
@@ -207,7 +208,8 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Unit-тесты (`tests/`) покрывают чистую логику пайплайна без обращения к ALM/LLM:
+Unit-тесты (`loader/src/auto_git_review/tests/`) покрывают чистую логику пайплайна
+без обращения к ALM/LLM:
 агрегацию батчей и dedup, рендеринг промптов, чтение настроек, сборку URL,
 разбор ответа LLM, расчёт метрик оценки и агрегацию метрик мониторинга.
 
@@ -216,7 +218,8 @@ Unit-тесты (`tests/`) покрывают чистую логику пайп
 Модуль `loader/src/auto_git_review/eval.py` рассчитывает качество ревьюера на
 golden-датасете: accuracy, Precision / Recall / F1 по каждому классу вердикта
 (`approve` / `request_changes` / `comment`) и confusion matrix. Схема датасета —
-`tests/eval/golden_dataset.example.json`. Живой прогон с моделью выполняется в
+`loader/src/auto_git_review/tests/eval/golden_dataset.example.json`. Живой прогон с
+моделью выполняется в
 корпоративном контуре: модель подключается через callable `reviewer(case) -> verdict`.
 
 ## Конфигурация
