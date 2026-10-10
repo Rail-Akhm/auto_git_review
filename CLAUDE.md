@@ -62,12 +62,19 @@ Azure DevOps Server (on-prem ALM).
   `pytest.ini`, `requirements-dev.txt`) на чистую логику пайплайна без обращения
   к ALM/LLM. Тесты лежат внутри пакета `auto_git_review` — переносятся на сервер
   вместе с рабочим кодом (не только в демо-ноутбуке).
-- **Тесты не запускаются ДАГом:** Airflow обходит только `dags_folder` (`dags/`),
-  папка тестов лежит в `loader/src/` и парсером не открывается; таска выполняет
-  ровно то, что в её `python_callable` (`run_review()`). Прогон — ручной, `pytest`
-  из корня проекта (`testpaths` в pytest 9 считается от каталога запуска), `pytest`
-  в рабочем `requirements.txt` не входит. Автозапуск тестов в ДАГе — не реализован
-  (обсуждался как опция «гейт перед ревью»).
+- **Тесты не запускаются рабочим ДАГом ревью:** Airflow обходит только
+  `dags_folder` (`dags/`), папка тестов лежит в `loader/src/` и парсером не
+  открывается; таска выполняет ровно то, что в её `python_callable`
+  (`run_review()`), а `pytest` в рабочем `requirements.txt` не входит. Автозапуск
+  тестов внутри таски ревью («гейт перед ревью») не реализован.
+- **Отдельный ДАГ ручного прогона тестов:**
+  `dags/prj_brddwh/auto_git_review_tests_dag.py` (`SERV__auto_git_review_tests`,
+  одна таска `run_unit_tests`, `schedule_interval=None`). Параметризован через
+  `params` ДАГа + Trigger DAG w/ config: `test_target` (пусто/`all` — все; файл,
+  `файл::тест`, каталог, несколько через запятую; просто имя уходит в `pytest -k`),
+  `keyword` (`-k`), `fail_fast` (`-x`), `collect_only`, `extra_args`. Запускает
+  pytest подпроцессом из корня проекта (подхватывается `pytest.ini`), стримит вывод
+  в лог, падает с хвостом вывода при ненулевом коде; Connections не нужны.
 
 ### Этапы (в перспективе)
 
@@ -186,7 +193,8 @@ production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`,
   одна таска `PythonOperator` на каждый репозиторий из `DAGConfiguration.REPOSITORIES`.
   Адреса и секреты (PAT, ключ LLM) берутся из Connections `api_git` / `llm_server`
   через `BaseHook.get_connection()` и раскладываются в `os.environ` функцией
-  `_apply_connections()`.
+  `_apply_connections()`. Второй ДАГ — `auto_git_review_tests_dag.py` — ручной
+  прогон unit-тестов (см. «Тесты не запускаются рабочим ДАГом ревью» выше).
 
 ## Рабочий процесс и деплой
 

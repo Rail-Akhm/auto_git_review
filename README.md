@@ -185,7 +185,8 @@ PR с эталонными вердиктами — скриптом прого�
 .
 ├── dags/
 │   └── prj_brddwh/
-│       └── auto_git_review_dag.py    # ДАГ Airflow: таска на каждый репозиторий
+│       ├── auto_git_review_dag.py    # ДАГ Airflow: таска на каждый репозиторий
+│       └── auto_git_review_tests_dag.py  # ДАГ ручного прогона unit-тестов
 ├── loader/
 │   └── src/
 │       └── auto_git_review/
@@ -275,13 +276,50 @@ Unit-тесты (`loader/src/auto_git_review/tests/`, 46 тестов) покр�
 отсчитываются от каталога запуска, поэтому, например, из `dags/prj_brddwh` не
 соберётся ни один тест.
 
-**Тесты не запускаются ДАГом.** Airflow обходит только `dags_folder` (`dags/`) и
-импортирует оттуда файлы в поисках объектов `DAG`; папка тестов лежит в
-`loader/src/`, поэтому парсер её не открывает. Таска выполняет ровно то, что
-описано в её `python_callable` — `review.run_review()`. Тесты запускаются
-отдельно, вручную (или в CI) на машине, где есть исходники; `pytest` относится к
+**Рабочим ДАГом ревью тесты не запускаются.** Airflow обходит только `dags_folder`
+(`dags/`) и импортирует оттуда файлы в поисках объектов `DAG`; папка тестов лежит в
+`loader/src/`, поэтому парсер её не открывает. Таска ДАГа ревью выполняет ровно то,
+что описано в её `python_callable` — `review.run_review()`. `pytest` относится к
 зависимостям разработки (`requirements-dev.txt`) и в рабочее окружение воркера не
 входит.
+
+### ДАГ ручного прогона тестов
+
+Для запуска тестов из Airflow есть отдельный параметризованный ДАГ —
+`dags/prj_brddwh/auto_git_review_tests_dag.py` (`SERV__auto_git_review_tests`,
+одна таска `run_unit_tests`, запуск только вручную — `schedule_interval=None`).
+Он вызывает pytest подпроцессом из корня проекта, поэтому подхватывается
+`pytest.ini`, и пишет вывод в лог таски. Секреты и Connections ему не нужны —
+тесты не обращаются ни к ALM, ни к LLM.
+
+Параметры задаются при запуске (Trigger DAG w/ config), все необязательные:
+
+| Параметр | Смысл |
+|---|---|
+| `test_target` | что запускать: пусто или `all` — все тесты; файл (`test_alm.py`), конкретный тест (`test_alm.py::test_decode_content_utf8`), каталог (`tests`), несколько целей через запятую; просто имя (`test_decode_content`) уходит в `pytest -k` |
+| `keyword` | выражение `-k` для фильтра по именам (`not eval`) |
+| `fail_fast` | остановиться на первом падении (`-x`) |
+| `collect_only` | не запускать, только показать список собранных тестов |
+| `extra_args` | дополнительные аргументы pytest строкой |
+
+Примеры config (в порядке таблицы выше — все тесты; один файл; один конкретный
+тест; несколько целей по именам; фильтр и стоп на первом падении; только список
+тестов):
+
+```json
+{}
+{"test_target": "test_alm.py"}
+{"test_target": "test_alm.py::test_decode_content_utf8"}
+{"test_target": "test_decode_content, test_batch"}
+{"keyword": "not eval", "fail_fast": true}
+{"collect_only": true}
+```
+
+Таска падает, если pytest не установлен в окружении воркера (в тексте ошибки —
+`pip install -r requirements-dev.txt`), если указанная цель не найдена (в ошибке
+перечисляются доступные файлы тестов) или если прогон вернул ненулевой код — в
+сообщение попадают последние 40 строк вывода pytest. При успехе в XCom уходит
+сводка (`command`, `returncode`, `summary`, например `46 passed in 0.16s`).
 
 ### Оценка качества (eval)
 
@@ -314,10 +352,12 @@ golden-датасете: accuracy, Precision / Recall / F1 по каждому �
 1. Создайте Connections:
    - `api_git` — host/port Azure DevOps Server, `password` = PAT;
    - `llm_server` — host/port LiteLLM-шлюза, `password` = LLM API key.
-2. Положите ДАГ `dags/prj_brddwh/auto_git_review_dag.py` в `dags_folder`.
+2. Положите ДАГ `dags/prj_brddwh/auto_git_review_dag.py` в `dags_folder`
+   (при необходимости — и `auto_git_review_tests_dag.py`, ДАГ ручного прогона
+   тестов; см. раздел «Тестирование»).
 3. Положите код проекта в `loader/src/auto_git_review/` (папку копируйте целиком,
-   вместе с `tests/` — ДАГ их не запускает, но они переносятся тем же комплектом;
-   см. раздел «Тестирование»).
+   вместе с `tests/` — ДАГ ревью их не запускает, но они переносятся тем же
+   комплектом; см. раздел «Тестирование»).
 4. Опишите репозитории в `DAGConfiguration.REPOSITORIES` — укажите для каждого
    `task_id`, `project`, `repo`, `prompt_name` и `post_comment`.
 
