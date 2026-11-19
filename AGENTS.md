@@ -15,7 +15,7 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
 Разработка ведётся в GitHub (`Rail-Akhm/auto_git_review`), эксплуатация — на
 корпоративном сервере Airflow.
 
-## Состояние на 2026-10-10
+## Состояние на 2026-11-19
 
 - Пайплайн ревью реализован целиком: сбор PR/diff/истории, батчевое ревью,
   агрегация вердиктов, dedup по маркеру, постинг комментария. Рабочий ДАГ —
@@ -23,15 +23,20 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
   по одной на репозиторий (`DAGConfiguration.REPOSITORIES`), `max_active_tasks=10`,
   `max_active_runs=1`, `execution_timeout=2h`, `retries=0`, ресурсы под
   KubernetesExecutor (1–2G RAM).
-- **Запуск только ручной:** у обоих ДАГов `schedule_interval=None`. Планировщика
+- **Запуск только ручной:** у всех трёх ДАГов `schedule_interval=None`. Планировщика
   (Этап 2) нет — расписание пока не настроено.
 - Второй ДАГ — `dags/prj_brddwh/auto_git_review_tests_dag.py`
   (`SERV__auto_git_review_tests`, ручной прогон pytest с параметрами).
+- Третий ДАГ — `dags/prj_brddwh/auto_git_review_model_benchmark_dag.py`
+  (`SERV__auto_git_review_model_benchmark`, ручной бенчмарк моделей: контекстное
+  окно, скорость, сравнение с рекомендацией). Самодостаточен — `loader/src` не
+  требует.
+- **Выбор модели (2026-11-19): `qwen3.6:35b-a3b-q8_0`.** У неё и у
+  `qwen3.8-think` / `qwen3.8-27b-fp8` фактическое окно — 262 144 токена;
+  рабочее допущение — 250k. 35b-a3b быстрее `qwen3.8-think` на ~20% при 8k
+  токенов и на ~40% при 32k; качество на golden-датасете ещё не сравнивалось.
 - 46 unit-тестов в `loader/src/auto_git_review/tests/` покрывают чистую логику
-  (без обращений к ALM/LLM). Последний коммит — `49900d1` от 2026-09-21
-  («Убрать ложные срабатывания ревью: кодировка и промпты»).
-- **Не закоммичено** (рабочее дерево на 2026-10-10): правки `CLAUDE.md` и
-  `README.md`, а также untracked `dags/prj_brddwh/auto_git_review_tests_dag.py`.
+  (без обращений к ALM/LLM); запускаются `pytest` из корня проекта.
 - Папка `auto_git_review_research/` — комплект для подачи на валидацию
   (ноутбук со встроенным production-кодом, README, ответ на замечания, отчёт
   `[Номер ЗНО C-1101243]`, презентация). В `report/` — те же материалы плюс
@@ -49,11 +54,18 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
 - **Полное содержимое файла обязательно.** Если класть в промпт только diff,
   модель отвечает «нет всего кода». Поэтому в промпт идут и unified diff, и полное
   новое содержимое файла.
-- **Лимиты контекста (~30k токенов у локальной модели):** `MAX_CHANGE_CHARS=12000`
-  (один файл), `MAX_DIFF_CHARS=2000` (diff), `MAX_BATCH_CHARS=30000` (батч,
-  ~8–10k токенов), `MAX_BATCHES=20` (в `DAGConfiguration`). При превышении
-  `MAX_BATCHES` PR не гоняется через LLM — формируется резюме «требуется ручное
-  ревью» с числом файлов (не падает).
+- **Контекст модели и лимиты батча.** Бенчмарк 2026-11-19 показал фактическое
+  окно **262 144 токена** у всех трёх моделей; рабочее допущение — **250k**.
+  Текущие лимиты взяты с большим запасом и пока не менялись:
+  `MAX_CHANGE_CHARS=12000` (один файл), `MAX_DIFF_CHARS=2000` (diff),
+  `MAX_BATCH_CHARS=30000` (батч, ~8–10k токенов), `MAX_BATCHES=20` (в
+  `DAGConfiguration`). При превышении `MAX_BATCHES` PR не гоняется через LLM —
+  формируется резюме «требуется ручное ревью» с числом файлов (не падает).
+- **Умность vs скорость.** По открытым публикациям Qwen3.8-27B сильнее в
+  reasoning/knowledge (GPQA-D до 89.2, HLE 33.9, IFBench 79.5), а
+  Qwen3.6-35B-A3B — в agentic coding (SWE-bench Verified 73.4, Terminal-Bench 2.0
+  51.5). Выбор `qwen3.6:35b-a3b-q8_0` сделан по скорости и окну; качество ревью
+  ещё не подтверждено eval на golden-датасете.
 - **Dedup — по маркеру, а не по автору.** `COMMENT_MARKER = "auto_git_review"`
   ищется в тексте комментариев PR **до** вызова LLM: владелец PAT — реальный
   пользователь, у него есть и свои комментарии.
@@ -145,13 +157,16 @@ review.run_review(repo="U200001871_mkhdbrd_greenplum",
 ## Открытые вопросы
 
 - Планировщик периодического опроса открытых PR (Этап 2) — не реализован; сейчас
-  оба ДАГа запускаются только вручную.
+  все три ДАГа запускаются только вручную.
 - Мгновенная реакция через Service Hook (webhook) вместо планировщика — заявлено
   на будущее.
 - Построчные комментарии (`threadContext`) вместо одного общего резюме —
   опционально, не сделано.
 - Живой прогон eval на golden-датасете с реальной моделью в корпоративном контуре
   (датасет пока только пример схемы) — не проверено.
+- Сравнить качество `qwen3.6:35b-a3b-q8_0` и `qwen3.8-think` на golden-датасете:
+  выбор 2026-11-19 сделан по скорости и окну, не по качеству ревью.
+- Увеличить `MAX_BATCH_CHARS` / батчи под окно 250k — только после eval качества.
 
 ## Источники
 
@@ -160,10 +175,12 @@ review.run_review(repo="U200001871_mkhdbrd_greenplum",
   конфигурация, запуск в Airflow.
 - `C:\Users\raila\.claude\projects\D--projects-auto-git-review\memory\MEMORY.md` и
   `deploy-manual-copy-no-github.md` (изм. 2026-08-18) — ручной перенос кода без GitHub.
-- `dags/prj_brddwh/auto_git_review_dag.py` и `auto_git_review_tests_dag.py` —
-  параметры ДАГов, `REPOSITORIES`, `MAX_BATCHES=20`, `schedule_interval=None`.
+- `dags/prj_brddwh/auto_git_review_dag.py`, `auto_git_review_tests_dag.py` и
+  `auto_git_review_model_benchmark_dag.py` — параметры ДАГов, `REPOSITORIES`,
+  `MAX_BATCHES=20`, `schedule_interval=None`, методика бенчмарка.
 - `loader/src/auto_git_review/{config,review,llm}.py`, `pytest.ini`,
   `requirements.txt`, `requirements-dev.txt`, `.env.example`, `.gitignore` —
-  переменные окружения, лимиты, состав тестов (46).
-- `git log` / `git status` (2026-10-10): последний коммит 2026-09-21, незакоммиченные
-  правки `CLAUDE.md` и `README.md`, untracked тестовый ДАГ.
+  переменные окружения, модель по умолчанию, лимиты, состав тестов (46).
+- `logs/` — загруженные вручную логи прогонов (в `.gitignore`): бенчмарк моделей
+  от 2026-11-19 подтвердил окно 262 144 и скорость 35b-a3b.
+- `git log` / `git status` (2026-11-19): выбор модели и бенчмарк закоммичены.

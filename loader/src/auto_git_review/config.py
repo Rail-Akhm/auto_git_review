@@ -24,6 +24,11 @@ AZURE_PROJECT_DEFAULT = "U200001871_mkhdbrd"
 AZURE_REPO_DEFAULT = "U200001871_mkhdbrd_greenplum"
 LLM_URL_DEFAULT = "https://spb99akl-dgx02.gazprom-neft.local/v1/chat/completions"
 
+# Выбранная модель (бенчмарк 2026-11-19): фактический предел контекста —
+# 262 144 токена, рабочее допущение — 250k. Замер: dags/prj_brddwh/
+# auto_git_review_model_benchmark_dag.py (контекст + скорость + сравнение).
+LLM_MODEL_DEFAULT = "qwen3.6:35b-a3b-q8_0"
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -55,7 +60,7 @@ def get_settings() -> Settings:
         api_version=os.environ.get("AZURE_DEVOPS_API_VERSION", "6.1-preview"),
         llm_url=os.environ.get("LLM_URL", LLM_URL_DEFAULT).rstrip("/"),
         llm_api_key=os.environ.get("LLM_API_KEY", "").strip(),
-        llm_model=os.environ.get("LLM_MODEL", "qwen3.8-think"),
+        llm_model=os.environ.get("LLM_MODEL", LLM_MODEL_DEFAULT),
         post_comments=_env_bool("POST_COMMENTS", "false"),
         verify_ssl=VERIFY_SSL,
     )

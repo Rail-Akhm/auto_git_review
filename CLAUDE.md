@@ -58,6 +58,12 @@ Azure DevOps Server (on-prem ALM).
   (`approve` → `request_changes`) бьёт по доверию к боту, FN (`request_changes` →
   `approve`) пропускает проблему в прод. Разбор метрик — в README, «Метрики
   качества».
+- **Бенчмарк моделей:** `dags/prj_brddwh/auto_git_review_model_benchmark_dag.py`
+  (`SERV__auto_git_review_model_benchmark`) — ручной замер фактического
+  контекстного окна (иголки + бинарный поиск) и скорости (2k/8k/32k токенов +
+  генерация), сравнение и рекомендация. По прогону 2026-11-19 окно у
+  `qwen3.6:35b-a3b-q8_0`, `qwen3.8-think` и `qwen3.8-27b-fp8` — 262 144 токена;
+  выбрана `qwen3.6:35b-a3b-q8_0` как самая быстрая.
 - **Автотесты:** unit-тесты pytest (`loader/src/auto_git_review/tests/`,
   `pytest.ini`, `requirements-dev.txt`) на чистую логику пайплайна без обращения
   к ALM/LLM. Тесты лежат внутри пакета `auto_git_review` — переносятся на сервер
@@ -146,9 +152,18 @@ production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`,
 | Протокол | OpenAI-совместимый (`messages`, `choices[0].message.content`) |
 | Аутентификация | заголовок `x-litellm-api-key: sk-...` |
 | TLS | `verify=False` |
-| Модели | `qwen3:latest` (основная), `ollama/deepseek-r1:1.5b-qwen-distill-q8_0` (запасная) |
-| Лимит контекста | ~30k токенов |
+| Модели | `qwen3.6:35b-a3b-q8_0` (основная, выбрана 2026-11-19), `qwen3.8-think` / `qwen3.8-27b-fp8` (альтернативы) |
+| Лимит контекста | 262 144 токена фактически; рабочее допущение — 250k токенов |
 | Стриминг | нет |
+
+Выбор модели и окна зафиксирован 2026-11-19 по бенчмарку
+(`dags/prj_brddwh/auto_git_review_model_benchmark_dag.py`): у всех трёх
+претендентов окно 262 144 токена, `qwen3.6:35b-a3b-q8_0` быстрее на ~20% при
+8k токенов и на ~40% при 32k. По открытым публикациям Qwen3.8-27B сильнее в
+reasoning/knowledge (GPQA-D до 89.2, HLE 33.9, IFBench 79.5), а
+Qwen3.6-35B-A3B — в agentic coding (SWE-bench Verified 73.4, Terminal-Bench 2.0
+51.5). Выбор сделан по скорости и окну; качество ревью нужно подтвердить eval
+на golden-датасете.
 
 ## Технические решения
 
@@ -163,7 +178,8 @@ production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`,
   (`/{collection}/{project}/_apis/...`), WIT — коллекционные (`/_apis/wit/...`).
 - **Клиент LLM:** тонкая обёртка над OpenAI-совместимым endpoint; модель выносится
   в конфиг, чтобы менять её без правки кода.
-- **Модель:** основная — `qwen3:latest`.
+- **Модель:** основная — `qwen3.6:35b-a3b-q8_0` (контекст 262 144, рабочее
+  допущение 250k); запасные — `qwen3.8-think` / `qwen3.8-27b-fp8`.
 - **Кодировка содержимого файлов:** ALM отдаёт `items?includeContent=true` с
   `Content-Type: text/plain` без charset, и `resp.text` декодирует байты как
   ISO-8859-1 (RFC 2616 для `text/*`) — русский текст в `COMMENT`'ах превращался в
@@ -182,11 +198,14 @@ production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`,
   только при реальных дефектах, а не при стилевых придирках.
 - **Результат ревью:** JSON (`verdict` + `summary` + `comments[]`), агрегируется по
   батчам и конвертируется в markdown-комментарий к PR.
-- **Ограничения размера (защита контекста ~30k токенов):**
+- **Ограничения размера (рабочее окно принято 250k токенов; фактический предел —
+  262 144):**
   - `MAX_CHANGE_CHARS = 12000` — полное содержимое одного файла;
   - `MAX_DIFF_CHARS = 2000` — блок изменённых строк (diff);
   - `MAX_BATCH_CHARS = 30000` — суммарный размер одного батча (~8–10k токенов);
   - `MAX_BATCHES = 20` — максимум батчей на PR (в `DAGConfiguration` ДАГа).
+  Текущие лимиты выбраны с большим запасом и пока не менялись: окно 250k
+  оставляет простор для увеличения батча после оценки качества модели.
 - **Dedup:** по маркеру `COMMENT_MARKER = "auto_git_review"` в тексте комментария
   (не по автору). Проверка — до вызова LLM.
 - **Оркестрация:** Apache Airflow. ДАГ `dags/prj_brddwh/auto_git_review_dag.py`:
@@ -195,6 +214,9 @@ production-код (`config.py`, `alm.py`, `llm.py`, `prompt.py`, `review.py`,
   через `BaseHook.get_connection()` и раскладываются в `os.environ` функцией
   `_apply_connections()`. Второй ДАГ — `auto_git_review_tests_dag.py` — ручной
   прогон unit-тестов (см. «Тесты не запускаются рабочим ДАГом ревью» выше).
+  Третий ДАГ — `auto_git_review_model_benchmark_dag.py` — ручной бенчмарк
+  моделей (контекстное окно + скорость + сравнение); он самодостаточен и
+  `loader/src` не требует.
 
 ## Рабочий процесс и деплой
 

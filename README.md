@@ -186,7 +186,8 @@ PR с эталонными вердиктами — скриптом прого�
 ├── dags/
 │   └── prj_brddwh/
 │       ├── auto_git_review_dag.py    # ДАГ Airflow: таска на каждый репозиторий
-│       └── auto_git_review_tests_dag.py  # ДАГ ручного прогона unit-тестов
+│       ├── auto_git_review_tests_dag.py  # ДАГ ручного прогона unit-тестов
+│       └── auto_git_review_model_benchmark_dag.py  # бенчмарк моделей
 ├── loader/
 │   └── src/
 │       └── auto_git_review/
@@ -330,6 +331,40 @@ golden-датасете: accuracy, Precision / Recall / F1 по каждому �
 моделью выполняется в корпоративном контуре: модель подключается через callable
 `reviewer(case) -> verdict`.
 
+### Модель и контекстное окно
+
+Зафиксировано 2026-11-19: рабочая модель — **`qwen3.6:35b-a3b-q8_0`**.
+Бенчмарк измерил фактическое окно **262 144 токена** у неё, `qwen3.8-think` и
+`qwen3.8-27b-fp8`; для планирования принято **250k токенов**.
+
+| Модель | Задержка @8k | Задержка @32k | Генерация, ток/с |
+|---|---:|---:|---:|
+| `qwen3.6:35b-a3b-q8_0` | 355,5 мс | 968 мс | 885 |
+| `qwen3.8-27b-fp8` | 443,5 мс | 1694 мс | 729 |
+| `qwen3.8-think` | 466 мс | 1618,5 мс | 726 |
+
+`qwen3.6:35b-a3b-q8_0` — MoE (35B всего / 3B активных), поэтому быстрее на
+длинных промптах. Её замеры коротких ответов упираются в `max_tokens` (модель
+уходит в рассуждение), поэтому задержка @8k — это время до 64 выходных токенов,
+а не до завершения ответа; по генерации она всё равно лидирует.
+
+По открытым публикациям Qwen3.8-27B сильнее в reasoning/knowledge (GPQA-D до
+89.2, HLE 33.9, IFBench 79.5), а Qwen3.6-35B-A3B — в agentic coding
+(SWE-bench Verified 73.4, Terminal-Bench 2.0 51.5). Выбор сделан по скорости и
+окну; качество ревью нужно подтвердить eval на golden-датасете. Текущие лимиты
+(`MAX_BATCH_CHARS=30000`, ~8–10k токенов) не менялись — окно 250k даёт большой
+запас для увеличения батчей после оценки качества.
+
+### Бенчмарк моделей
+
+`dags/prj_brddwh/auto_git_review_model_benchmark_dag.py`
+(`SERV__auto_git_review_model_benchmark`) — ручной ДАГ: для каждой модели
+замеряет фактическое контекстное окно (коды-«иголки» в начале и конце промпта +
+бинарный поиск), скорость на 2k/8k/32k токенов и скорость генерации, затем
+печатает сравнение с рекомендацией и строку `MODEL_BENCHMARK_RESULTS` в лог.
+Запускается через Trigger DAG w/ config; самодостаточен — нужен только
+Connection `llm_server`, папка `loader/src` не требуется.
+
 ## Конфигурация
 
 Конфигурация задаётся переменными окружения (см. `.env.example`):
@@ -343,7 +378,7 @@ golden-датасете: accuracy, Precision / Recall / F1 по каждому �
 | `AZURE_DEVOPS_API_VERSION` | Версия REST API (по умолчанию `6.1-preview`) |
 | `LLM_URL` | Endpoint LLM (`/v1/chat/completions`) |
 | `LLM_API_KEY` | Ключ LLM |
-| `LLM_MODEL` | Модель (по умолчанию `qwen3:latest`) |
+| `LLM_MODEL` | Модель (по умолчанию `qwen3.6:35b-a3b-q8_0`, окно 262 144 токена) |
 | `POST_COMMENTS` | Публиковать комментарии в PR (`true`/`false`) |
 | `VERIFY_SSL` | Проверять TLS-сертификат (`false` для самоподписанных) |
 
@@ -353,8 +388,9 @@ golden-датасете: accuracy, Precision / Recall / F1 по каждому �
    - `api_git` — host/port Azure DevOps Server, `password` = PAT;
    - `llm_server` — host/port LiteLLM-шлюза, `password` = LLM API key.
 2. Положите ДАГ `dags/prj_brddwh/auto_git_review_dag.py` в `dags_folder`
-   (при необходимости — и `auto_git_review_tests_dag.py`, ДАГ ручного прогона
-   тестов; см. раздел «Тестирование»).
+   (при необходимости — `auto_git_review_tests_dag.py`, ДАГ ручного прогона
+   тестов, и `auto_git_review_model_benchmark_dag.py` — самодостаточный бенчмарк
+   моделей; см. разделы «Тестирование» и «Бенчмарк моделей»).
 3. Положите код проекта в `loader/src/auto_git_review/` (папку копируйте целиком,
    вместе с `tests/` — ДАГ ревью их не запускает, но они переносятся тем же
    комплектом; см. раздел «Тестирование»).
