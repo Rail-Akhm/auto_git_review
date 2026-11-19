@@ -121,7 +121,10 @@ def record_review(metrics: dict) -> bool:
 
     Никогда не поднимает исключение наружу: ошибка метрик не должна ломать ревью.
     """
-    if not _enabled() or not metrics:
+    if not _enabled():
+        logger.info("Запись метрик отключена (METRICS_ENABLED=false)")
+        return False
+    if not metrics:
         return False
 
     source_commit = str(metrics.get("source_commit") or "").strip()
@@ -155,9 +158,11 @@ def record_review(metrics: dict) -> bool:
             conn.commit()
     except Exception as exc:
         logger.warning(
-            "Не удалось записать метрики ревью PR #%s в %s: %s",
+            "Не удалось записать метрики ревью PR #%s в %s "
+            "(connection %s): %s",
             metrics.get("pr_id"),
             table,
+            _conn_id(),
             exc,
         )
         return False

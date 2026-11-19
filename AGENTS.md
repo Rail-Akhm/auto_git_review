@@ -51,7 +51,7 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
   `reasoning` + повтор; при сбое — `LlmUnavailableError`/`LlmResponseError`,
   задача падает, частичный отчёт не публикуется.
 - **Метрики в GreenPlum.** `metrics.py` пишет одну строку на сформированное
-  ревью в `prj_brddwh.serv_git_auto_review` (Connection `edw_klad-pbrddw`,
+  ревью в `prj_brddwh.serv_git_auto_review` (Connection `edw_klad-pbrddw_prod`,
   psycopg2): project/repo/pr_id/source_commit, review_thread_id, review_date,
   review_verdict, content, context_chars, tokens, latency_ms, llm_latency_ms.
   Запись best-effort; идемпотентность — delete+insert по

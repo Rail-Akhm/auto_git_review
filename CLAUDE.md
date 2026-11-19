@@ -69,7 +69,7 @@ Azure DevOps Server (on-prem ALM).
   одной JSON-строкой `REVIEW_RUN_METRICS` в конце `run_review()`.
 - **Метрики в GreenPlum:** `metrics.py` после каждого сформированного ревью пишет
   одну строку в `prj_brddwh.serv_git_auto_review` через Airflow Connection
-  `edw_klad-pbrddw` (psycopg2). Поля: project/repo/pr_id/source_commit,
+  `edw_klad-pbrddw_prod` (psycopg2). Поля: project/repo/pr_id/source_commit,
   review_thread_id, review_date, review_verdict, content (длина комментария),
   context_chars, tokens, latency_ms (end-to-end), llm_latency_ms. Запись
   best-effort — ошибка БД не валит ревью; перед INSERT строка с тем же

@@ -286,7 +286,32 @@ def _master_rule_comment_exists(alm: AlmClient, pr_id: int, marker: str) -> bool
     return False
 
 
-def _post_master_rule_comment(
+def _find_master_rule_comment(alm: AlmClient, pr_id: int):
+    """Найти наш комментарий о запрете PR: thread_id, длина, дата публикации."""
+    try:
+        threads = alm.get_threads(pr_id).get("value", [])
+    except Exception as exc:
+        logger.warning(
+            "Не удалось найти комментарий master-правила PR #%s: %s", pr_id, exc
+        )
+        return None
+    for thread in threads:
+        for comment in thread.get("comments", []):
+            if comment.get("isDeleted"):
+                continue
+            content = comment.get("content") or ""
+            if COMMENT_MARKER not in content:
+                continue
+            if "master_rule=" in content or REJECT_VOTE_RE.search(content):
+                return {
+                    "thread_id": thread.get("id"),
+                    "content_chars": len(content),
+                    "published": _parse_iso_datetime(comment.get("publishedDate")),
+                }
+    return None
+
+
+def _post_master_rule_comment_meta(
     alm: AlmClient,
     pr_id: int,
     issue: str,
@@ -294,18 +319,14 @@ def _post_master_rule_comment(
     tgt_commit: str,
     rejected: bool,
     log,
-) -> bool:
-    """Опубликовать объяснение запрета, если код PR уже отревьюен (dedup).
-
-    Отдельный комментарий с красным блоком и маркером master_rule, чтобы голос
-    -10 не появлялся в PR без объяснения и не дублировался при каждом прогоне.
-    """
+):
+    """Опубликовать объяснение запрета; вернуть метаданные комментария или None."""
     rule_hash = hashlib.sha1(
         f"{issue}|{src_commit or ''}".encode("utf-8")
     ).hexdigest()[:12]
     marker = f"{COMMENT_MARKER}:master_rule={rule_hash}"
     if _master_rule_comment_exists(alm, pr_id, marker):
-        return False
+        return None
 
     parsed = {
         "verdict": "forbidden",
@@ -328,14 +349,32 @@ def _post_master_rule_comment(
             pr_id,
             thread.get("id"),
         )
-        return True
+        return {"thread_id": thread.get("id"), "content_chars": len(text)}
     except Exception as exc:
         log.error(
             "    Не удалось опубликовать объяснение запрета PR #%s: %s",
             pr_id,
             exc,
         )
-        return False
+        return None
+
+
+def _post_master_rule_comment(
+    alm: AlmClient,
+    pr_id: int,
+    issue: str,
+    src_commit: str,
+    tgt_commit: str,
+    rejected: bool,
+    log,
+) -> bool:
+    """Совместимая обёртка: True, если комментарий опубликован."""
+    return (
+        _post_master_rule_comment_meta(
+            alm, pr_id, issue, src_commit, tgt_commit, rejected, log
+        )
+        is not None
+    )
 
 
 def _parse_json_response(text: str):
@@ -1002,10 +1041,33 @@ def _review_one_pr(
     )
     if rejected_before:
         log.info("    PR уже отклонён — новые комментарии не публикую.")
+        if master_issue and settings.post_comments:
+            # Заполняем метрику отклонения, даже если ревью-комментарий уже был
+            # (иначе в таблице не останется следа о запрете).
+            rule_meta = _find_master_rule_comment(alm, pr_id)
+            if rule_meta:
+                record_review(
+                    {
+                        "project": settings.azure_project,
+                        "repo": settings.azure_repo,
+                        "pr_id": pr_id,
+                        "source_commit": src_commit,
+                        "review_thread_id": rule_meta.get("thread_id"),
+                        "review_date": rule_meta.get("published")
+                        or datetime.now(timezone.utc),
+                        "review_verdict": "forbidden",
+                        "content": rule_meta.get("content_chars") or 0,
+                        "context_chars": 0,
+                        "tokens": 0,
+                        "latency_ms": 0,
+                        "llm_latency_ms": 0,
+                    }
+                )
         if not master_issue and _master_pr_was_rejected(alm, pr_id):
             _clear_master_rejection(alm, pr_id, log)
         return None
 
+    rule_meta = None
     if master_issue:
         log.warning("    %s", master_issue)
         raw_description = pr.get("description") or ""
@@ -1022,7 +1084,7 @@ def _review_one_pr(
             if already:
                 # Код уже отревьюен, новый ревью-комментарий не появится —
                 # публикуем отдельное объяснение запрета.
-                _post_master_rule_comment(
+                rule_meta = _post_master_rule_comment_meta(
                     alm, pr_id, master_issue, src_commit, tgt_commit, rejected, log
                 )
     elif (
@@ -1033,6 +1095,24 @@ def _review_one_pr(
         _clear_master_rejection(alm, pr_id, log)
 
     if already:
+        if rule_meta:
+            # Метрика отклонения: отдельного результата ревью здесь нет.
+            record_review(
+                {
+                    "project": settings.azure_project,
+                    "repo": settings.azure_repo,
+                    "pr_id": pr_id,
+                    "source_commit": src_commit,
+                    "review_thread_id": rule_meta.get("thread_id"),
+                    "review_date": datetime.now(timezone.utc),
+                    "review_verdict": "forbidden",
+                    "content": rule_meta.get("content_chars") or 0,
+                    "context_chars": 0,
+                    "tokens": 0,
+                    "latency_ms": int((time.monotonic() - started) * 1000),
+                    "llm_latency_ms": 0,
+                }
+            )
         log.info(
             "    Комментарий для коммита %s уже есть — пропускаю PR.",
             (src_commit or "?")[:8],
