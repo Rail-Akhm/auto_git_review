@@ -20,7 +20,8 @@ def test_get_settings_from_env(monkeypatch):
     monkeypatch.setenv("AZURE_DEVOPS_REPO", "repo1")
     monkeypatch.setenv("LLM_URL", "https://llm.example/v1/chat/completions")
     monkeypatch.setenv("LLM_API_KEY", "sk-key")
-    monkeypatch.setenv("LLM_MODEL", "qwen3:latest")
+    monkeypatch.setenv("LLM_MODEL", "qwen3.8-27b-fp8")
+    monkeypatch.setenv("LLM_MODEL_FALLBACK", "qwen3.8-think")
     monkeypatch.setenv("POST_COMMENTS", "true")
 
     s = get_settings()
@@ -28,5 +29,15 @@ def test_get_settings_from_env(monkeypatch):
     assert s.azure_project == "Proj1"
     assert s.azure_pat == "secret-pat"
     assert s.azure_repo == "repo1"
-    assert s.llm_model == "qwen3:latest"
+    assert s.llm_model == "qwen3.8-27b-fp8"
+    assert s.llm_model_fallback == "qwen3.8-think"
     assert s.post_comments is True
+
+
+def test_get_settings_model_defaults(monkeypatch):
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL_FALLBACK", raising=False)
+
+    s = get_settings()
+    assert s.llm_model == "qwen3.8-27b-fp8"
+    assert s.llm_model_fallback == "qwen3.8-think"

@@ -1,5 +1,10 @@
 """Тесты чистой логики ревью (без сети): парсинг, обрезка, батчи, агрегация, формат."""
 
+import logging
+from unittest.mock import MagicMock
+
+import pytest
+
 from auto_git_review import review
 
 
@@ -94,6 +99,122 @@ def test_format_review_comment_contains_marker_and_verdict():
     assert "a.sql:1" in text
 
 
+def test_format_review_comment_records_reviewed_commit():
+    parsed = {"verdict": "approve", "summary": "ok", "comments": []}
+    sha = "a" * 40
+    target = "c" * 40
+    text = review._format_review_comment(parsed, sha, target)
+    assert "Проверенный коммит" in text
+    assert f"reviewed_commit={sha}" in text
+    assert f"reviewed_target={target}" in text
+
+
+class _ThreadsAlm:
+    """ALM-заглушка: отдаёт заданные комментарии PR."""
+
+    def __init__(self, contents):
+        self._contents = contents
+
+    def get_threads(self, pr_id):
+        return {
+            "value": [
+                {
+                    "comments": [
+                        {"content": content, "isDeleted": False}
+                        for content in self._contents
+                    ]
+                }
+            ]
+        }
+
+
+class _BrokenAlm:
+    def get_threads(self, pr_id):
+        raise ConnectionError("alm down")
+
+
+def test_already_reviewed_without_marker():
+    assert review._already_reviewed(_ThreadsAlm(["обычный комментарий"]), 1, "a" * 40) is False
+
+
+def test_already_reviewed_same_commit():
+    sha = "a" * 40
+    content = f"**Автоматическое ревью ({review.COMMENT_MARKER})**\n<!-- {review.COMMENT_MARKER}:reviewed_commit={sha} -->"
+    assert review._already_reviewed(_ThreadsAlm([content]), 1, sha) is True
+
+
+def test_already_reviewed_short_sha_matches():
+    content = f"<!-- {review.COMMENT_MARKER}:reviewed_commit={'b' * 8} -->"
+    assert review._already_reviewed(_ThreadsAlm([content]), 1, "b" * 40) is True
+
+
+def test_already_reviewed_new_commit_triggers_review():
+    content = f"<!-- {review.COMMENT_MARKER}:reviewed_commit={'a' * 40} -->"
+    assert review._already_reviewed(_ThreadsAlm([content]), 1, "b" * 40) is False
+
+
+def test_already_reviewed_target_moved_triggers_review():
+    content = (
+        f"<!-- {review.COMMENT_MARKER}:reviewed_commit={'a' * 40}"
+        f" reviewed_target={'c' * 40} -->"
+    )
+    assert review._already_reviewed(
+        _ThreadsAlm([content]), 1, "a" * 40, "c" * 40
+    ) is True
+    assert review._already_reviewed(
+        _ThreadsAlm([content]), 1, "a" * 40, "d" * 40
+    ) is False
+
+
+def test_already_reviewed_visible_line_fallback():
+    # HTML-комментарий вырезан рендерером — SHA берём из видимой строки.
+    content = (
+        f"**Автоматическое ревью ({review.COMMENT_MARKER})**\n\n"
+        "**Проверенный коммит:** `aaaaaaaa` (target `cccccccc`)"
+    )
+    assert review._already_reviewed(
+        _ThreadsAlm([content]), 1, "a" * 40, "c" * 40
+    ) is True
+    assert review._already_reviewed(
+        _ThreadsAlm([content]), 1, "b" * 40, "c" * 40
+    ) is False
+
+
+def test_already_reviewed_legacy_comment_without_sha():
+    # Комментарий старого формата: SHA нет — перепроверяем один раз.
+    content = f"**Автоматическое ревью ({review.COMMENT_MARKER})**"
+    assert review._already_reviewed(_ThreadsAlm([content]), 1, "a" * 40) is False
+
+
+def test_already_reviewed_alm_error_skips_to_avoid_duplicate():
+    assert review._already_reviewed(_BrokenAlm(), 1, "a" * 40) is True
+
+
+def test_collect_pr_changes_prefers_iteration_source_commit():
+    alm = MagicMock()
+    alm.get_pull_request.return_value = {
+        "lastMergeSourceCommit": {"commitId": "old"},
+        "lastMergeTargetCommit": {"commitId": "target"},
+    }
+    alm.get_pr_iterations.return_value = {
+        "value": [
+            {"id": 1, "sourceRefCommit": {"commitId": "old"}},
+            {"id": 2, "sourceRefCommit": {"commitId": "new"}},
+        ]
+    }
+    alm.get_pr_iteration_changes.return_value = {
+        "changeEntries": [{"item": {"path": "/a.sql"}}]
+    }
+
+    src, tgt, changes = review._collect_pr_changes(
+        alm, 1, logging.getLogger("test")
+    )
+    assert src == "new"
+    assert tgt == "target"
+    assert changes == [{"item": {"path": "/a.sql"}}]
+    alm.get_pr_iteration_changes.assert_called_once_with(1, 2)
+
+
 def test_format_history_empty():
     assert review._format_history([]) == "(истории нет — файл создаётся впервые)"
 
@@ -128,3 +249,61 @@ def test_format_change_edit_contains_diff_and_full():
     assert "[ИЗМЕНЁН] /a/b.sql" in out
     assert "Изменённые строки (diff)" in out
     assert "Полное содержимое файла" in out
+
+
+class _UnavailableLlm:
+    """LLM-шлюз лежит: любой вызов падает."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages):
+        self.calls += 1
+        raise ConnectionError("llm server is down")
+
+
+class _FlakyLlm:
+    """Первый батч проходит, второй — сбой транспорта."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "content": '{"verdict": "approve", "summary": "ok", "comments": []}',
+                "usage": {"total_tokens": 10},
+                "latency_ms": 5,
+                "model": "qwen3.8-27b-fp8",
+                "fallback_used": False,
+            }
+        raise ConnectionError("llm server is down")
+
+
+def test_review_batches_raises_when_llm_unavailable():
+    llm = _UnavailableLlm()
+    with pytest.raises(review.LlmUnavailableError):
+        review._review_pr_batches(
+            llm,
+            "[[WORK_ITEM]]\n[[FILES]]",
+            [["file1"], ["file2"]],
+            "work item",
+            logging.getLogger("test"),
+        )
+    # Не перебираем все батчи и таймауты: падаем на первом же сбое.
+    assert llm.calls == 1
+
+
+def test_review_batches_raises_on_failure_after_success():
+    llm = _FlakyLlm()
+    with pytest.raises(review.LlmUnavailableError):
+        review._review_pr_batches(
+            llm,
+            "[[WORK_ITEM]]\n[[FILES]]",
+            [["file1"], ["file2"]],
+            "work item",
+            logging.getLogger("test"),
+        )
+    # Первый батч прошёл, второй упал — ревью не считается успешным.
+    assert llm.calls == 2

@@ -24,10 +24,13 @@ AZURE_PROJECT_DEFAULT = "U200001871_mkhdbrd"
 AZURE_REPO_DEFAULT = "U200001871_mkhdbrd_greenplum"
 LLM_URL_DEFAULT = "https://spb99akl-dgx02.gazprom-neft.local/v1/chat/completions"
 
-# Выбранная модель (бенчмарк 2026-11-19): фактический предел контекста —
-# 262 144 токена, рабочее допущение — 250k. Замер: dags/prj_brddwh/
+# Основная и запасная модели (выбор 2026-11-19): обе Qwen3.8-27B с окном
+# 262 144 токена; рабочее допущение — 250k. Основная — FP8 (качество
+# подтверждено замером: FP8 ≈ BF16), запасная — think-вариант на случай
+# недоступности/перегрузки основной. Замер: dags/prj_brddwh/
 # auto_git_review_model_benchmark_dag.py (контекст + скорость + сравнение).
-LLM_MODEL_DEFAULT = "qwen3.6:35b-a3b-q8_0"
+LLM_MODEL_DEFAULT = "qwen3.8-27b-fp8"
+LLM_MODEL_FALLBACK_DEFAULT = "qwen3.8-think"
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,8 @@ class Settings:
     llm_api_key: str
     llm_model: str
     post_comments: bool
+    # Пусто — автоматическое переключение на запасную модель выключено.
+    llm_model_fallback: str = ""
     verify_ssl: bool = VERIFY_SSL
 
 
@@ -61,6 +66,9 @@ def get_settings() -> Settings:
         llm_url=os.environ.get("LLM_URL", LLM_URL_DEFAULT).rstrip("/"),
         llm_api_key=os.environ.get("LLM_API_KEY", "").strip(),
         llm_model=os.environ.get("LLM_MODEL", LLM_MODEL_DEFAULT),
+        llm_model_fallback=os.environ.get(
+            "LLM_MODEL_FALLBACK", LLM_MODEL_FALLBACK_DEFAULT
+        ),
         post_comments=_env_bool("POST_COMMENTS", "false"),
         verify_ssl=VERIFY_SSL,
     )

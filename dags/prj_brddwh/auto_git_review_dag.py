@@ -11,6 +11,12 @@
 Адреса и секреты берутся из Airflow Connections:
   - api_git    : Azure DevOps Server (host, port, password=PAT)
   - llm_server : локальный LLM через LiteLLM (host, port, password=LLM API key)
+
+Модели задаются в DAGConfiguration (LLM_MODEL / LLM_FALLBACK_MODEL) и
+раскладываются в os.environ, если не переопределены:
+  - основная  : qwen3.8-27b-fp8 (окно 262 144 токена, рабочее допущение 250k);
+  - запасная  : qwen3.8-think (подключается автоматически при 5xx/таймауте/
+                недоступности основной модели).
 """
 
 import os
@@ -29,10 +35,16 @@ class DAGConfiguration:
     DAG_DESCRIPTION = "Автоматическое ревью открытых PR в Azure DevOps Server"
     DAG_MAX_ACTIVE_TASKS = 10
 
-    # Максимум батчей на один PR (для одного запуска ревью). Если PR порождает
-    # больше батчей (тяжёлые случаи, напр. тысячи файлов) — полный анализ невозможен,
-    # и формируется общее резюме с числом файлов вместо вызова LLM.
+    # Максимум батчей на один PR (для одного запуска ревью). При лимите батча
+    # 400k символов (~90–200k токенов) 20 батчей покрывают очень крупные PR.
+    # Если PR порождает больше батчей — полный анализ невозможен, формируется
+    # общее резюме с числом файлов вместо вызова LLM.
     MAX_BATCHES = 20
+
+    # Модели (выбор 2026-11-19): окно 262 144 токена, рабочее допущение — 250k.
+    # Основная — FP8 (качество ≈ BF16), запасная — think при сбое основной.
+    LLM_MODEL = "qwen3.8-27b-fp8"
+    LLM_FALLBACK_MODEL = "qwen3.8-think"
 
     # Airflow Connections
     CONN_ALM = "api_git"
@@ -155,10 +167,16 @@ def _apply_connections(project=None):
         os.environ["LLM_API_KEY"] = (conn_llm.get_password() or conn_llm.login or "").strip()
     if not os.environ.get("LLM_URL") and conn_llm.host:
         os.environ["LLM_URL"] = _build_url("https", conn_llm.host, conn_llm.port, DC.LLM_PATH)
+    if not os.environ.get("LLM_MODEL"):
+        os.environ["LLM_MODEL"] = DC.LLM_MODEL
+    if not os.environ.get("LLM_MODEL_FALLBACK"):
+        os.environ["LLM_MODEL_FALLBACK"] = DC.LLM_FALLBACK_MODEL
 
     log.info("AZURE_DEVOPS_URL     = %s", os.environ.get("AZURE_DEVOPS_URL"))
     log.info("AZURE_DEVOPS_PROJECT = %s", os.environ.get("AZURE_DEVOPS_PROJECT"))
     log.info("LLM_URL              = %s", os.environ.get("LLM_URL"))
+    log.info("LLM_MODEL            = %s", os.environ.get("LLM_MODEL"))
+    log.info("LLM_MODEL_FALLBACK   = %s", os.environ.get("LLM_MODEL_FALLBACK"))
 
 
 def run_wrapper(

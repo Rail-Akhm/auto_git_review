@@ -3,6 +3,7 @@
 import difflib
 import json
 import logging
+import re
 import time
 from dataclasses import replace
 
@@ -14,17 +15,24 @@ from .prompt import load_prompt, render_prompt
 
 logger = logging.getLogger("auto_git_review")
 
-# Максимальный размер ПОЛНОГО содержимого одного файла, подаваемого в промпт
-# (защита контекста ~30k токенов). Раньше для изменённых файлов подавался только
-# unified diff с 3 строками контекста — модель видела фрагменты и считала код неполным.
-MAX_CHANGE_CHARS = 12000
+# Лимиты под рабочее окно 250k токенов (фактический предел модели —
+# 262 144). Оценка «символов на токен» ~4.5 верна для латиницы, но код и
+# кириллица токенизируются плотнее, поэтому оставляем запас и место на промпт
+# и ответ модели.
+
+# Максимальный размер ПОЛНОГО содержимого одного файла, подаваемого в промпт.
+# Раньше для изменённых файлов подавался только unified diff с 3 строками
+# контекста — модель видела фрагменты и считала код неполным.
+MAX_CHANGE_CHARS = 200_000
 
 # Отдельный, меньший лимит на блок «изменённые строки» (diff) — вторичен по объёму.
-MAX_DIFF_CHARS = 2000
+MAX_DIFF_CHARS = 20_000
 
-# Максимальный суммарный размер одного «батча» файлов, подаваемого в ОДИН вызов LLM
-# (~8–10k токенов). Большие PR ревьюятся по частям, результаты потом агрегируются.
-MAX_BATCH_CHARS = 30000
+# Максимальный суммарный размер одного «батча» файлов, подаваемого в ОДИН вызов LLM.
+# 400k символов — это ориентировочно 90–200k токенов в зависимости от плотности
+# токенизации; остаётся запас до 250k на промпт и ответ. Большие PR ревьюятся по
+# частям, результаты потом агрегируются.
+MAX_BATCH_CHARS = 400_000
 
 CHANGE_TYPE_LABELS = {
     "add": "новый файл",
@@ -35,6 +43,17 @@ CHANGE_TYPE_LABELS = {
 
 # Маркер, по которому узнаём собственные комментарии бота (для dedup при повторных запусках).
 COMMENT_MARKER = "auto_git_review"
+
+# SHA проверенных коммитов, записанные в комментарии бота. По ним понимаем,
+# появились ли после ревью новые коммиты (source) или уехала целевая ветка
+# (target), и нужен ли повторный проход.
+REVIEWED_COMMIT_RE = re.compile(r"reviewed_commit=([0-9a-fA-F]{7,40})")
+REVIEWED_TARGET_RE = re.compile(r"reviewed_target=([0-9a-fA-F]{7,40})")
+# Резервный разбор видимой строки — если HTML-комментарий вырежет рендерер.
+VISIBLE_COMMITS_RE = re.compile(
+    r"Проверенный коммит:\*\*\s*`([0-9a-fA-F]{7,40})`"
+    r"(?:\s*\(target\s*`([0-9a-fA-F]{7,40})`\))?"
+)
 
 
 def _parse_json_response(text: str):
@@ -93,13 +112,26 @@ def _describe_work_items(alm: AlmClient, pr_id: int) -> str:
     return "\n".join(descriptions)
 
 
-def _format_review_comment(parsed: dict) -> str:
-    """Формирует markdown-текст общего комментария к PR из результата ревью."""
+def _format_review_comment(
+    parsed: dict, reviewed_commit: str = None, target_commit: str = None
+) -> str:
+    """Формирует markdown-текст общего комментария к PR из результата ревью.
+
+    В комментарий записываются SHA проверенных source- и target-коммитов: по
+    ним следующий запуск отличит «уже отревьюено» от «человек докатил новый
+    коммит» или «уехала целевая ветка».
+    """
     verdict = parsed.get("verdict", "?")
     summary = (parsed.get("summary") or "").strip()
     comments = parsed.get("comments") or []
 
     lines = [f"**Автоматическое ревью ({COMMENT_MARKER})**", ""]
+    if reviewed_commit:
+        commit_line = f"**Проверенный коммит:** `{reviewed_commit[:8]}`"
+        if target_commit:
+            commit_line += f" (target `{target_commit[:8]}`)"
+        lines.append(commit_line)
+        lines.append("")
     lines.append(f"**Вердикт:** {verdict}")
     if summary:
         lines.append("")
@@ -115,15 +147,33 @@ def _format_review_comment(parsed: dict) -> str:
             text = (c.get("text") or "").strip()
             locator = f"{file_path}:{line}" if line else file_path
             lines.append(f"- `{locator}` ({severity}): {text}")
+    if reviewed_commit:
+        # Скрытый маркер для dedup: человеку не мешает, парсится регуляркой.
+        marker = f"{COMMENT_MARKER}:reviewed_commit={reviewed_commit}"
+        if target_commit:
+            marker += f" reviewed_target={target_commit}"
+        lines.append("")
+        lines.append(f"<!-- {marker} -->")
     return "\n".join(lines)
 
 
-def _already_reviewed(alm: AlmClient, pr_id: int) -> bool:
-    """True, если у PR уже есть наш не-удалённый комментарий (по маркеру COMMENT_MARKER).
+def _already_reviewed(
+    alm: AlmClient,
+    pr_id: int,
+    source_commit: str = None,
+    target_commit: str = None,
+) -> bool:
+    """True, если текущее состояние PR (source+target) уже отревьюено.
 
     Проверяем по маркеру в тексте, а не по автору: владелец PAT — реальный
     пользователь, у которого могут быть и собственные комментарии. Маркер
     однозначно отделяет комментарий бота.
+
+    Если хотя бы в одном нашем комментарии записан SHA, совпадающий с текущим
+    source-коммитом (и target, если он там указан), — ревью актуально, PR
+    пропускается. Комментарий для старого коммита означает, что человек
+    докатил изменения (или уехала целевая ветка), — нужен новый проход.
+    Старые комментарии без SHA перепроверяются один раз.
     """
     try:
         threads = alm.get_threads(pr_id).get("value", [])
@@ -137,12 +187,53 @@ def _already_reviewed(alm: AlmClient, pr_id: int) -> bool:
         )
         return True
 
+    found_marker = False
+    reviewed = []
     for thread in threads:
         for comment in thread.get("comments", []):
             if comment.get("isDeleted"):
                 continue
-            if COMMENT_MARKER in (comment.get("content") or ""):
-                return True
+            content = comment.get("content") or ""
+            if COMMENT_MARKER not in content:
+                continue
+            found_marker = True
+            src_match = REVIEWED_COMMIT_RE.search(content)
+            if src_match:
+                tgt_match = REVIEWED_TARGET_RE.search(content)
+                reviewed.append(
+                    (
+                        src_match.group(1).lower(),
+                        tgt_match.group(1).lower() if tgt_match else None,
+                    )
+                )
+            else:
+                # Резерв: видимая строка «Проверенный коммит: `sha` (target `sha`)».
+                visible = VISIBLE_COMMITS_RE.search(content)
+                if visible:
+                    reviewed.append(
+                        (visible.group(1).lower(), (visible.group(2) or "").lower() or None)
+                    )
+
+    if not found_marker:
+        return False
+    if not source_commit:
+        # Сравнивать не с чем — не рискуем отправить второй комментарий.
+        return True
+    if not reviewed:
+        # Комментарий старого формата (без SHA) — перепроверим один раз.
+        return False
+
+    def same_commit(left, right):
+        return left == right or left.startswith(right) or right.startswith(left)
+
+    source = source_commit.lower()
+    target = target_commit.lower() if target_commit else None
+    for reviewed_source, reviewed_target in reviewed:
+        if not same_commit(source, reviewed_source):
+            continue
+        if target and reviewed_target and not same_commit(target, reviewed_target):
+            continue
+        return True
     return False
 
 
@@ -297,20 +388,40 @@ def _collect_pr_changes(alm: AlmClient, pr_id: int, log) -> tuple:
     log.info("    lastMergeTargetCommit: %s", tgt_commit)
 
     changes = []
-    if not src_commit or not tgt_commit:
-        log.warning("    Нет коммитов для diff, изменения не собраны.")
-        return src_commit, tgt_commit, changes
-
     try:
         iterations = alm.get_pr_iterations(pr_id).get("value", [])
         if iterations:
-            last_iteration = max(it["id"] for it in iterations)
-            changes = alm.get_pr_iteration_changes(pr_id, last_iteration).get(
-                "changeEntries", []
+            last_iteration = max(iterations, key=lambda it: it.get("id", 0))
+            # Для активного PR source-коммит последней итерации — это ровно то,
+            # что человек запушил последним; он же фиксируется в комментарии бота.
+            iteration_src = (last_iteration.get("sourceRefCommit") or {}).get(
+                "commitId"
             )
+            if iteration_src:
+                src_commit = iteration_src
+                log.info(
+                    "    Итерация %s, sourceRefCommit: %s",
+                    last_iteration.get("id"),
+                    src_commit,
+                )
+            changes = alm.get_pr_iteration_changes(
+                pr_id, last_iteration["id"]
+            ).get("changeEntries", [])
     except Exception as exc:
         log.warning("    Не удалось получить список файлов PR #%s: %s", pr_id, exc)
+
+    if not src_commit or not tgt_commit:
+        log.warning("    Нет коммитов для diff, изменения не собираются.")
+        changes = []
     return src_commit, tgt_commit, changes
+
+
+class LlmUnavailableError(RuntimeError):
+    """LLM не дала ответа: ревью PR прервано и задача Airflow должна упасть.
+
+    Недоступность шлюза или отвергнутый запрос не должны выглядеть как
+    «успешный» прогон без ревью (например, когда сервер LLM лежал).
+    """
 
 
 def _review_pr_batches(
@@ -322,6 +433,10 @@ def _review_pr_batches(
       - parsed — итоговый dict (verdict + summary + comments) или None, если ни
         один батч не дал разобранный JSON-ответ;
       - total_latency_ms / total_tokens — суммарные метрики вызовов LLM по PR.
+
+    Поднимает ``LlmUnavailableError`` при любом сбое вызова LLM: недоступность
+    шлюза (или отвергнутый запрос) не должна выглядеть как успешный прогон, а
+    частичный отчёт без остальных батчей — публиковаться.
     """
     parsed_batches = []
     total_latency_ms = 0
@@ -343,7 +458,23 @@ def _review_pr_batches(
             content = response["content"]
         except Exception as exc:
             log.warning("    Батч %d/%d: ошибка вызова LLM: %s", bi, len(batches), exc)
-            continue
+            # Любой сбой вызова — повод прервать ревью PR и завалить задачу:
+            # частичный отчёт опаснее ошибки (может пропустить дефекты), а серия
+            # таймаутов на остальных батчах только растянет прогон.
+            raise LlmUnavailableError(
+                f"LLM не дала ответа на батч {bi}/{len(batches)} — ревью PR "
+                f"прервано, остальные батчи не запускались. "
+                f"Последняя ошибка: {exc}"
+            ) from exc
+        if response.get("fallback_used"):
+            log.warning(
+                "    Батч %d/%d: основная модель «%s» недоступна — ответ получен "
+                "на запасной «%s»",
+                bi,
+                len(batches),
+                response.get("fallback_from"),
+                response.get("model"),
+            )
         total_latency_ms += response.get("latency_ms", 0)
         usage = response.get("usage") or {}
         total_tokens += usage.get("total_tokens", 0)
@@ -392,15 +523,20 @@ def _review_one_pr(
     log.info("PR #%s «%s» (автор: %s)", pr_id, title, author)
     log.info("  Ветки: %s -> %s", pr.get("sourceRefName"), pr.get("targetRefName"))
 
-    # Dedup: проверяем наличие нашего комментария ДО запуска LLM — не тратим
-    # вызовы модели на уже отревьюенные PR (только в режиме постинга).
-    if settings.post_comments and _already_reviewed(alm, pr_id):
-        log.info("    Комментарий от бота уже есть — пропускаю PR.")
-        return None
-
     log.info("  Шаг 2: получаю детали PR #%s...", pr_id)
     src_commit, tgt_commit, changes = _collect_pr_changes(alm, pr_id, log)
     log.info("    Изменённых файлов: %d", len(changes))
+
+    # Dedup по проверенному коммиту: старый комментарий не блокирует ревью,
+    # если после него человек запушил новые коммиты (только в режиме постинга).
+    if settings.post_comments and _already_reviewed(
+        alm, pr_id, src_commit, tgt_commit
+    ):
+        log.info(
+            "    Комментарий для коммита %s уже есть — пропускаю PR.",
+            (src_commit or "?")[:8],
+        )
+        return None
 
     log.info("  Шаг 3: получаю связанные work items...")
     work_items_text = _describe_work_items(alm, pr_id)
@@ -461,7 +597,7 @@ def _review_one_pr(
     if settings.post_comments:
         log.info("    Отправляю резюме в PR как комментарий...")
         try:
-            comment_text = _format_review_comment(parsed)
+            comment_text = _format_review_comment(parsed, src_commit, tgt_commit)
             thread = alm.create_thread_comment(pr_id, comment_text)
             log.info("    Комментарий создан, thread id=%s", thread.get("id"))
         except Exception as exc:
@@ -490,16 +626,21 @@ def run_review(
     post_comment: bool = False,
     prompt_name: str = None,
     max_batches: int = 20,
+    model: str = None,
+    fallback_model: str = None,
 ):
     """Главная функция: ревью всех открытых PR. Подробно логирует каждый шаг.
 
     Параметры (передаются из таски Airflow):
-      - repo         — имя репозитория в ALM (если None — из настроек/config.py);
-      - project      — имя проекта ALM (если None — из настроек/config.py);
-      - post_comment — отправлять ли резюме комментарием в PR;
-      - prompt_name  — файл промпта в prompts/ (для разных типов репозиториев);
-      - max_batches  — максимум батчей на один PR; при превышении полный анализ
-                       не выполняется, возвращается общее резюме.
+      - repo           — имя репозитория в ALM (если None — из настроек/config.py);
+      - project        — имя проекта ALM (если None — из настроек/config.py);
+      - post_comment   — отправлять ли резюме комментарием в PR;
+      - prompt_name    — файл промпта в prompts/ (для разных типов репозиториев);
+      - max_batches    — максимум батчей на один PR; при превышении полный анализ
+                         не выполняется, возвращается общее резюме;
+      - model          — основная LLM-модель (переопределяет LLM_MODEL);
+      - fallback_model — запасная модель при недоступности основной
+                         (переопределяет LLM_MODEL_FALLBACK).
     """
     log = log or logger
 
@@ -513,6 +654,10 @@ def run_review(
         settings = replace(settings, azure_project=project)
     if post_comment:
         settings = replace(settings, post_comments=True)
+    if model:
+        settings = replace(settings, llm_model=model)
+    if fallback_model:
+        settings = replace(settings, llm_model_fallback=fallback_model)
     prompt_name = prompt_name or "review_prompt_greenplum.md"
 
     log.info("Настройки загружены:")
@@ -520,9 +665,17 @@ def run_review(
     log.info("  Проект       : %s", settings.azure_project)
     log.info("  Репозиторий  : %s", settings.azure_repo)
     log.info("  LLM модель   : %s", settings.llm_model)
+    log.info("  Запасная LLM : %s", settings.llm_model_fallback or "—")
     log.info("  LLM endpoint : %s", settings.llm_url)
     log.info("  Промпт       : %s", prompt_name)
     log.info("  Пост-коммент : %s", settings.post_comments)
+    log.info(
+        "  Лимиты       : файл=%d, diff=%d, батч=%d симв., батчей≤%d",
+        MAX_CHANGE_CHARS,
+        MAX_DIFF_CHARS,
+        MAX_BATCH_CHARS,
+        max_batches,
+    )
 
     if not settings.azure_pat:
         raise RuntimeError("Не задан AZURE_DEVOPS_PAT (пустой токен).")
