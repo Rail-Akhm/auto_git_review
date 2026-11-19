@@ -1,7 +1,7 @@
 """Запись метрик ревью в GreenPlum (одна строка на ревью PR).
 
 Таблица: ``prj_brddwh.serv_git_auto_review`` (по умолчанию), подключение —
-Airflow Connection ``edw_klad-pbrddw`` (Postgres-совместимый драйвер psycopg2).
+Airflow Connection ``edw_klad-pbrddw_prod`` (Postgres-совместимый драйвер psycopg2).
 
 Запись best-effort: любая ошибка БД/драйвера логируется, но не валит ревью.
 Идемпотентность: перед INSERT удаляется строка с тем же
@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("auto_git_review.metrics")
 
-DEFAULT_CONN_ID = "edw_klad-pbrddw"
+DEFAULT_CONN_ID = "edw_klad-pbrddw_prod"
 DEFAULT_TABLE = "prj_brddwh.serv_git_auto_review"
 
 _COLUMNS = (
