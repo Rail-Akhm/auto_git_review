@@ -55,7 +55,7 @@ def get_settings() -> Settings:
         api_version=os.environ.get("AZURE_DEVOPS_API_VERSION", "6.1-preview"),
         llm_url=os.environ.get("LLM_URL", LLM_URL_DEFAULT).rstrip("/"),
         llm_api_key=os.environ.get("LLM_API_KEY", "").strip(),
-        llm_model=os.environ.get("LLM_MODEL", "qwen3:latest"),
+        llm_model=os.environ.get("LLM_MODEL", "qwen3.8-think"),
         post_comments=_env_bool("POST_COMMENTS", "false"),
         verify_ssl=VERIFY_SSL,
     )
