@@ -35,6 +35,11 @@ MAX_DIFF_CHARS = 20_000
 # частям, результаты потом агрегируются.
 MAX_BATCH_CHARS = 400_000
 
+# Сколько раз повторять вызов, если модель вернула пустой или невалидный JSON
+# (по транспортным ошибкам работает fallback в LlmClient, здесь — именно
+# «пустой content», как в случае с обрывом генерации).
+LLM_RESPONSE_RETRIES = 1
+
 CHANGE_TYPE_LABELS = {
     "add": "новый файл",
     "edit": "изменён",
@@ -455,19 +460,31 @@ class LlmUnavailableError(RuntimeError):
     """
 
 
+class LlmResponseError(RuntimeError):
+    """LLM ответила пустым или невалидным JSON даже после повтора.
+
+    Пример: модель вернула 0 символов content (иногда ответ остаётся только в
+    reasoning или обрезается). Ревью не сформировано — задача должна упасть,
+    а не завершиться «успешно» без комментария.
+    """
+
+
 def _review_pr_batches(
     llm: LlmClient, prompt_template: str, batches: list, work_items_text: str, log
 ) -> tuple:
     """Ревью одного PR по батчам: вызов LLM на каждый батч и агрегация результата.
 
     Возвращает кортеж (parsed, total_latency_ms, total_tokens):
-      - parsed — итоговый dict (verdict + summary + comments) или None, если ни
-        один батч не дал разобранный JSON-ответ;
-      - total_latency_ms / total_tokens — суммарные метрики вызовов LLM по PR.
+      - parsed — итоговый dict (verdict + summary + comments);
+      - total_latency_ms / total_tokens — суммарные метрики всех попыток по PR.
 
-    Поднимает ``LlmUnavailableError`` при любом сбое вызова LLM: недоступность
-    шлюза (или отвергнутый запрос) не должна выглядеть как успешный прогон, а
-    частичный отчёт без остальных батчей — публиковаться.
+    JSON ищется сначала в ``content``, затем в ``reasoning`` (у «thinking»-
+    моделей итог иногда остаётся только там). При пустом/невалидном ответе
+    вызов повторяется ``LLM_RESPONSE_RETRIES`` раз.
+
+    Поднимает ``LlmUnavailableError`` при сбое вызова LLM и ``LlmResponseError``,
+    если после повтора ответ так и не удалось разобрать: ревью без результата
+    не должно выглядеть как успешный прогон.
     """
     parsed_batches = []
     total_latency_ms = 0
@@ -484,42 +501,96 @@ def _review_pr_batches(
                 ),
             }
         ]
-        try:
-            response = llm.chat(messages)
-            content = response["content"]
-        except Exception as exc:
-            log.warning("    Батч %d/%d: ошибка вызова LLM: %s", bi, len(batches), exc)
-            # Любой сбой вызова — повод прервать ревью PR и завалить задачу:
-            # частичный отчёт опаснее ошибки (может пропустить дефекты), а серия
-            # таймаутов на остальных батчах только растянет прогон.
-            raise LlmUnavailableError(
-                f"LLM не дала ответа на батч {bi}/{len(batches)} — ревью PR "
-                f"прервано, остальные батчи не запускались. "
-                f"Последняя ошибка: {exc}"
-            ) from exc
-        if response.get("fallback_used"):
-            log.warning(
-                "    Батч %d/%d: основная модель «%s» недоступна — ответ получен "
-                "на запасной «%s»",
+        parsed = None
+        for attempt in range(1, LLM_RESPONSE_RETRIES + 2):
+            try:
+                response = llm.chat(messages)
+            except Exception as exc:
+                log.warning(
+                    "    Батч %d/%d: ошибка вызова LLM: %s", bi, len(batches), exc
+                )
+                # Любой сбой вызова — повод прервать ревью PR и завалить задачу:
+                # частичный отчёт опаснее ошибки (может пропустить дефекты), а
+                # серия таймаутов на остальных батчах только растянет прогон.
+                raise LlmUnavailableError(
+                    f"LLM не дала ответа на батч {bi}/{len(batches)} — ревью PR "
+                    f"прервано, остальные батчи не запускались. "
+                    f"Последняя ошибка: {exc}"
+                ) from exc
+
+            if response.get("fallback_used"):
+                log.warning(
+                    "    Батч %d/%d: основная модель «%s» недоступна — ответ "
+                    "получен на запасной «%s»",
+                    bi,
+                    len(batches),
+                    response.get("fallback_from"),
+                    response.get("model"),
+                )
+
+            usage = response.get("usage") or {}
+            total_latency_ms += response.get("latency_ms", 0)
+            total_tokens += usage.get("total_tokens", 0)
+            content = response.get("content") or ""
+            reasoning = response.get("reasoning") or ""
+            finish_reason = response.get("finish_reason")
+            completion_tokens = usage.get("completion_tokens")
+
+            log.info(
+                "    Батч %d/%d (попытка %d/%d): content=%d симв., "
+                "reasoning=%d симв., finish=%s, completion_tokens=%s",
                 bi,
                 len(batches),
-                response.get("fallback_from"),
-                response.get("model"),
+                attempt,
+                LLM_RESPONSE_RETRIES + 1,
+                len(content),
+                len(reasoning),
+                finish_reason,
+                completion_tokens,
             )
-        total_latency_ms += response.get("latency_ms", 0)
-        usage = response.get("usage") or {}
-        total_tokens += usage.get("total_tokens", 0)
-        log.info("    Батч %d/%d: ответ LLM (%d символов)", bi, len(batches), len(content))
-        parsed = _parse_json_response(content)
-        if parsed:
-            parsed_batches.append(parsed)
-        else:
+
+            # Обычный ответ — content. «Thinking»-модель иногда оставляет
+            # итоговый JSON только в reasoning — не теряем его.
+            parsed = _parse_json_response(content)
+            if parsed:
+                break
+            parsed = _parse_json_response(reasoning)
+            if parsed:
+                log.warning(
+                    "    Батч %d/%d: JSON найден в reasoning "
+                    "(content пустой/невалидный)",
+                    bi,
+                    len(batches),
+                )
+                break
+
+            if attempt <= LLM_RESPONSE_RETRIES:
+                log.warning(
+                    "    Батч %d/%d: пустой/невалидный ответ LLM — повтор "
+                    "(попытка %d/%d)",
+                    bi,
+                    len(batches),
+                    attempt + 1,
+                    LLM_RESPONSE_RETRIES + 1,
+                )
+                continue
+
+            raw = content or reasoning
             log.warning(
                 "    Батч %d/%d: не удалось разобрать JSON-ответ, сырой текст:",
                 bi,
                 len(batches),
             )
-            log.warning("%s", content[:1000])
+            log.warning("%s", raw[:1000])
+            raise LlmResponseError(
+                f"LLM вернула пустой/невалидный ответ на батч {bi}/{len(batches)} "
+                f"после {LLM_RESPONSE_RETRIES + 1} попыток "
+                f"(finish={finish_reason}, completion_tokens={completion_tokens}, "
+                f"content={len(content)} симв., reasoning={len(reasoning)} симв.). "
+                f"Ревью PR прервано."
+            )
+
+        parsed_batches.append(parsed)
 
     log.info(
         "    Итого по PR: %d батч(ей), latency=%dms, tokens=%d",

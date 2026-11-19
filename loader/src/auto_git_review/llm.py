@@ -103,23 +103,36 @@ class LlmClient:
         latency_ms = int((time.monotonic() - started) * 1000)
         resp.raise_for_status()
         data = resp.json()
-        message = data["choices"][0]["message"]
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
         usage = data.get("usage")
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        finish_reason = choice.get("finish_reason")
 
         logger.info(
-            "LLM ответ (%s): latency=%dms, tokens=%s",
+            "LLM ответ (%s): latency=%dms, tokens=%s, finish=%s",
             model,
             latency_ms,
             usage.get("total_tokens") if usage else "нет данных",
+            finish_reason,
         )
+        if not content and reasoning:
+            # У «thinking»-моделей ответ иногда целиком остаётся в reasoning.
+            logger.warning(
+                "LLM (%s): content пустой, reasoning=%d симв. — использую его",
+                model,
+                len(reasoning),
+            )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("LLM ответ: %s", message)
 
         return {
-            "content": message.get("content") or "",
-            "reasoning": message.get("reasoning_content") or "",
+            "content": content,
+            "reasoning": reasoning,
             "usage": usage,
             "latency_ms": latency_ms,
             "model": model,
             "fallback_used": False,
+            "finish_reason": finish_reason,
         }

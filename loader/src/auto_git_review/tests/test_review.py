@@ -344,3 +344,109 @@ def test_review_batches_raises_on_failure_after_success():
         )
     # Первый батч прошёл, второй упал — ревью не считается успешным.
     assert llm.calls == 2
+
+
+_VALID_REVIEW = '{"verdict": "approve", "summary": "ok", "comments": []}'
+
+
+class _ReasoningLlm:
+    """content пустой, итоговый JSON лежит в reasoning."""
+
+    def chat(self, messages):
+        return {
+            "content": "",
+            "reasoning": _VALID_REVIEW,
+            "usage": {"total_tokens": 5},
+            "latency_ms": 3,
+            "model": "qwen3.8-think",
+            "fallback_used": False,
+            "finish_reason": "stop",
+        }
+
+
+class _RetryLlm:
+    """Первый ответ пустой, второй — валидный JSON."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "content": "",
+                "reasoning": "",
+                "usage": {"total_tokens": 5},
+                "latency_ms": 3,
+                "model": "qwen3.8-27b-fp8",
+                "fallback_used": False,
+                "finish_reason": "length",
+            }
+        return {
+            "content": _VALID_REVIEW,
+            "reasoning": "",
+            "usage": {"total_tokens": 5},
+            "latency_ms": 3,
+            "model": "qwen3.8-27b-fp8",
+            "fallback_used": False,
+            "finish_reason": "stop",
+        }
+
+
+class _EmptyLlm:
+    """Модель всегда отвечает пустым content и reasoning."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages):
+        self.calls += 1
+        return {
+            "content": "",
+            "reasoning": "",
+            "usage": {"total_tokens": 5, "completion_tokens": 0},
+            "latency_ms": 3,
+            "model": "qwen3.8-27b-fp8",
+            "fallback_used": False,
+            "finish_reason": "stop",
+        }
+
+
+def test_review_batches_uses_json_from_reasoning():
+    parsed, _, _ = review._review_pr_batches(
+        _ReasoningLlm(),
+        "[[WORK_ITEM]]\n[[FILES]]",
+        [["file1"]],
+        "work item",
+        logging.getLogger("test"),
+    )
+    assert parsed["verdict"] == "approve"
+
+
+def test_review_batches_retries_empty_response():
+    llm = _RetryLlm()
+    parsed, latency_ms, tokens = review._review_pr_batches(
+        llm,
+        "[[WORK_ITEM]]\n[[FILES]]",
+        [["file1"]],
+        "work item",
+        logging.getLogger("test"),
+    )
+    assert parsed["verdict"] == "approve"
+    assert llm.calls == review.LLM_RESPONSE_RETRIES + 1
+    assert latency_ms == 6
+    assert tokens == 10
+
+
+def test_review_batches_raises_on_empty_response_after_retries():
+    llm = _EmptyLlm()
+    with pytest.raises(review.LlmResponseError) as exc_info:
+        review._review_pr_batches(
+            llm,
+            "[[WORK_ITEM]]\n[[FILES]]",
+            [["file1"]],
+            "work item",
+            logging.getLogger("test"),
+        )
+    assert llm.calls == review.LLM_RESPONSE_RETRIES + 1
+    assert "content=0" in str(exc_info.value)
