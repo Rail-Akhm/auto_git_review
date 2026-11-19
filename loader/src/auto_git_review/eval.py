@@ -9,7 +9,8 @@ import json
 from pathlib import Path
 
 # Канонические вердикты (совпадают с форматом ответа модели).
-VERDICTS = ["approve", "request_changes", "comment"]
+# forbidden — полный запрет PR (нарушение регламента), самый тяжёлый класс.
+VERDICTS = ["forbidden", "request_changes", "comment", "approve"]
 
 
 def load_dataset(path) -> list:

@@ -54,6 +54,22 @@ def test_create_thread_comment_body_and_url():
     assert body["comments"][0]["commentType"] == 1
 
 
+def test_reject_pull_request_sets_minus_10_vote():
+    client = AlmClient(_settings())
+    client.get_authenticated_user_id = MagicMock(return_value="user-1")
+    client.session.put = MagicMock(
+        return_value=_fake_response({"id": "user-1", "vote": -10})
+    )
+
+    result = client.reject_pull_request(123)
+
+    assert result["vote"] == -10
+    call_kwargs = client.session.put.call_args
+    url, kwargs = call_kwargs.args[0], call_kwargs.kwargs
+    assert "pullRequests/123/reviewers/user-1" in url
+    assert kwargs["json"] == {"vote": -10}
+
+
 def _fake_response(payload):
     resp = MagicMock()
     resp.json.return_value = payload

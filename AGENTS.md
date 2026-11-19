@@ -6,7 +6,7 @@
 Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, собирает diff +
 полное содержимое изменённых файлов + историю 5 последних коммитов по каждому файлу,
 отдаёт всё локальной LLM через LiteLLM-шлюз, публикует вердикт
-(`approve` / `request_changes` / `comment`) комментарием в PR.
+(вердикт `approve` / `request_changes` / `comment` / `forbidden`) комментарием в PR.
 
 Стек: Python 3.10+, `requests`, Apache Airflow (оркестрация), pytest. Всё работает
 внутри корпоративного контура — внешних сервисов нет. Ревью настраивается на
@@ -36,7 +36,7 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
   262 144 токена; рабочее допущение — 250k. 35b-a3b быстрее на ~20% при 8k и на
   ~40% при 32k, но для ревью выбрана 3.8-27B как более сильная в reasoning;
   переключение на запасную автоматическое.
-- 74 unit-теста в `loader/src/auto_git_review/tests/` покрывают чистую логику
+- 86 unit-тестов в `loader/src/auto_git_review/tests/` покрывают чистую логику
   (без обращений к ALM/LLM); запускаются `pytest` из корня проекта.
 - Папка `auto_git_review_research/` — комплект для подачи на валидацию
   (ноутбук со встроенным production-кодом, README, ответ на замечания, отчёт
@@ -82,10 +82,18 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
   обязательна ссылка на предыдущий PR в develop (URL `/pullrequest/<id>` или
   «Запрос на вытягивание <id>»); source-ветка должна быть отдельной веткой
   отбора, не личной/фича-веткой. Правило прописано во всех промптах; в
-  `review.py` `_master_pr_issue()` детерминированно принуждает
-  `request_changes` с critical-замечанием, если ссылки нет или source-ветка
-  совпадает с веткой предыдущего PR в develop. Для develop-PR правило не
-  действует.
+  `review.py` `_master_pr_issue()` детерминированно принуждает `forbidden`
+  (полный запрет PR) с critical-замечанием, если ссылки нет или source-ветка
+  совпадает с веткой предыдущего PR в develop. Дополнительно при `post_comments`
+  ставится голос ревьюера **-10 («Отклонить»)** от имени PAT — только для
+  master/main и только при нарушении; на обычные PR не влияет. После устранения
+  нарушения следующий прогон снимает голос `-10`, если в комментарии есть
+  маркер агента `vote=-10`. Для develop-PR правило не действует.
+- **Вердикт `forbidden` — полный запрет PR.** Используется только для нарушений
+  регламента (например, прямой PR в master), не для дефектов кода. В
+  комментарии оформляется красным блоком: `## 🔴 PR ЗАПРЕЩЁН К ВЛИВАНИЮ`,
+  цитата-предупреждение и разделитель; в приоритете выше `request_changes`.
+  Для PR вне master/main `forbidden` понижается до `request_changes`.
 - **Dedup — по маркеру, а не по автору.** `COMMENT_MARKER = "auto_git_review"`
   ищется в тексте комментариев PR **до** вызова LLM: владелец PAT — реальный
   пользователь, у него есть и свои комментарии. В комментарий пишется SHA
@@ -117,8 +125,8 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
 - **`git pull` на сервере невозможен** — у корпоративного контура нет доступа к
   GitHub (см. «Как запускать»).
 - **Батч-агрегация:** вердикт по приоритету
-  `request_changes > comment > approve`, summary склеивается «Часть N», comments
-  объединяются.
+  `forbidden > request_changes > comment > approve`, summary склеивается «Часть N»,
+  comments объединяются.
 - **Мониторинг и eval:** `monitoring.py` пишет сводные метрики одной JSON-строкой
   `REVIEW_RUN_METRICS` в конце `run_review()`; `eval.py` считает accuracy /
   Precision / Recall / F1 (one-vs-rest по классам) и confusion matrix на
@@ -145,7 +153,7 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                   # все 74 теста
+pytest                                   # все 86 тестов
 pytest loader/src/auto_git_review/tests/test_alm.py
 pytest -k test_decode_content
 ```

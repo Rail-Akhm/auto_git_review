@@ -11,6 +11,13 @@ def test_compute_metrics_perfect_accuracy():
     assert metrics["correct"] == 2
 
 
+def test_compute_metrics_includes_forbidden_class():
+    metrics = compute_metrics(["forbidden", "approve"], ["forbidden", "forbidden"])
+    # forbidden: tp=1, fp=1, fn=0 -> precision 0.5, recall 1.0
+    assert metrics["precision"]["forbidden"] == pytest.approx(0.5)
+    assert metrics["recall"]["forbidden"] == pytest.approx(1.0)
+
+
 def test_compute_metrics_accuracy_and_confusion():
     expected = ["approve", "approve", "request_changes"]
     predicted = ["approve", "request_changes", "request_changes"]

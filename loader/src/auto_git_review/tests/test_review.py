@@ -64,6 +64,106 @@ def test_merge_results_verdict_priority():
     assert review._merge_results(parsed)["verdict"] == "request_changes"
 
 
+def test_merge_results_forbidden_has_highest_priority():
+    parsed = [
+        {"verdict": "approve"},
+        {"verdict": "request_changes"},
+        {"verdict": "forbidden"},
+    ]
+    assert review._merge_results(parsed)["verdict"] == "forbidden"
+
+
+def test_apply_master_rule_forces_forbidden():
+    parsed = {"verdict": "approve", "summary": "ok", "comments": []}
+    pr = {
+        "targetRefName": "refs/heads/master",
+        "description": "Обновлено README.md",
+    }
+    issue = review._master_pr_issue(None, pr)
+    assert issue
+    result = review._apply_master_rule(
+        parsed, issue, logging.getLogger("test")
+    )
+    assert result["verdict"] == "forbidden"
+    assert any(c["severity"] == "critical" for c in result["comments"])
+    assert "PR запрещён" in result["summary"]
+
+
+class _RejectAlm:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = 0
+
+    def reject_pull_request(self, pr_id):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("no permission")
+        return {"id": "reviewer-1"}
+
+
+def test_clamp_forbidden_only_for_master():
+    log = logging.getLogger("test")
+    parsed = {"verdict": "forbidden", "summary": "", "comments": []}
+    develop_pr = {"targetRefName": "refs/heads/develop"}
+    assert (
+        review._clamp_forbidden(parsed, develop_pr, log)["verdict"]
+        == "request_changes"
+    )
+
+    master_pr = {"targetRefName": "refs/heads/master"}
+    parsed = {"verdict": "forbidden", "summary": "", "comments": []}
+    assert review._clamp_forbidden(parsed, master_pr, log)["verdict"] == "forbidden"
+
+
+def test_reject_master_pr_success():
+    alm = _RejectAlm()
+    assert review._reject_master_pr(alm, 1, logging.getLogger("test")) is True
+    assert alm.calls == 1
+
+
+def test_reject_master_pr_failure_is_logged():
+    alm = _RejectAlm(fail=True)
+    assert review._reject_master_pr(alm, 1, logging.getLogger("test")) is False
+    assert alm.calls == 1
+
+
+class _VoteAlm:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = []
+
+    def set_pull_request_vote(self, pr_id, vote):
+        self.calls.append((pr_id, vote))
+        if self.fail:
+            raise RuntimeError("no permission")
+        return {"vote": vote}
+
+
+def test_format_review_comment_records_reject_vote_marker():
+    parsed = {"verdict": "forbidden", "summary": "x", "comments": []}
+    text = review._format_review_comment(
+        parsed, "a" * 40, "c" * 40, rejected=True
+    )
+    assert "vote=-10" in text
+
+
+def test_master_pr_was_rejected_by_marker():
+    content = f"<!-- {review.COMMENT_MARKER}:reviewed_commit={'a' * 40} vote=-10 -->"
+    assert review._master_pr_was_rejected(_ThreadsAlm([content]), 1) is True
+    assert review._master_pr_was_rejected(_ThreadsAlm(["обычный комментарий"]), 1) is False
+
+
+def test_clear_master_rejection_sets_zero_vote():
+    alm = _VoteAlm()
+    assert review._clear_master_rejection(alm, 1, logging.getLogger("test")) is True
+    assert alm.calls == [(1, 0)]
+
+    failing = _VoteAlm(fail=True)
+    assert review._clear_master_rejection(
+        failing, 1, logging.getLogger("test")
+    ) is False
+
+
 def test_merge_results_summary_multiple_parts():
     parsed = [
         {"verdict": "approve", "summary": "A"},
@@ -97,6 +197,26 @@ def test_format_review_comment_contains_marker_and_verdict():
     assert "request_changes" in text
     assert "Найдены проблемы" in text
     assert "a.sql:1" in text
+
+
+def test_format_review_comment_forbidden_is_red_and_prominent():
+    parsed = {
+        "verdict": "forbidden",
+        "summary": "Нарушен регламент",
+        "comments": [
+            {
+                "file": "PR description",
+                "line": None,
+                "severity": "critical",
+                "text": "PR запрещён",
+            }
+        ],
+    }
+    text = review._format_review_comment(parsed)
+    assert "🔴 PR ЗАПРЕЩЁН К ВЛИВАНИЮ" in text
+    assert "Полный запрет PR" in text
+    assert "forbidden" in text
+    assert review.COMMENT_MARKER in text
 
 
 def test_format_review_comment_records_reviewed_commit():
@@ -236,6 +356,12 @@ def test_previous_pr_id_from_ado_link_and_text():
         )
         == 161341
     )
+    assert (
+        review._previous_pr_id(
+            "https://alm.example/TFS/GPN/P/_git/repo/pullRequests?pullRequestId=161341"
+        )
+        == 161341
+    )
     assert review._previous_pr_id("PR #42") == 42
     assert review._previous_pr_id("нет ссылки на предыдущий PR") is None
 
@@ -248,6 +374,17 @@ class _PreviousPrAlm:
 
     def get_pull_request(self, pr_id):
         return {"sourceRefName": self._source}
+
+
+def test_master_pr_issue_blocks_direct_test_branch():
+    # Именно кейс «своя ветка -> master, описание без ссылки на develop-PR».
+    pr = {
+        "targetRefName": "refs/heads/master",
+        "sourceRefName": "refs/heads/test_pr_to_master",
+        "description": "Обновлено README.md",
+    }
+    issue = review._master_pr_issue(None, pr)
+    assert issue and "нет ссылки на предыдущий PR" in issue
 
 
 def test_master_pr_issue_requires_previous_pr_link():

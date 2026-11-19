@@ -54,6 +54,7 @@ COMMENT_MARKER = "auto_git_review"
 # появились ли после ревью новые коммиты (source) или уехала целевая ветка
 # (target), и нужен ли повторный проход.
 REVIEWED_COMMIT_RE = re.compile(r"reviewed_commit=([0-9a-fA-F]{7,40})")
+REJECT_VOTE_RE = re.compile(r"vote=-10\b")
 # Резервный разбор видимой строки — если HTML-комментарий вырежет рендерер.
 VISIBLE_COMMITS_RE = re.compile(
     r"Проверенный коммит:\*\*\s*`([0-9a-fA-F]{7,40})`"
@@ -67,6 +68,7 @@ MASTER_BRANCHES = {"master", "main"}
 # «Запрос на вытягивание <id>», «PR #<id>», «Pull Request <id>».
 PREVIOUS_PR_LINK_RE = re.compile(
     r"/pullrequests?/(\d+)"
+    r"|pullrequestid=(\d+)"
     r"|запрос на вытягивание\s*#?\s*(\d+)"
     r"|\bpull request\s*#?\s*(\d+)"
     r"|\bPR\s*#?\s*(\d+)",
@@ -87,6 +89,10 @@ def _previous_pr_id(description: str):
     return next((int(group) for group in match.groups() if group), None)
 
 
+def _is_master_target(pr: dict) -> bool:
+    return _branch_short(pr.get("targetRefName")) in MASTER_BRANCHES
+
+
 def _master_pr_issue(alm: AlmClient, pr: dict):
     """Нарушение регламента для PR в master или None, если всё в порядке.
 
@@ -94,16 +100,17 @@ def _master_pr_issue(alm: AlmClient, pr: dict):
     (2) source-ветка не совпадает с веткой предыдущего develop-PR — иначе это
     PR напрямую из личной/фича-ветки, а не отдельный отбор изменений.
     """
-    if _branch_short(pr.get("targetRefName")) not in MASTER_BRANCHES:
+    if not _is_master_target(pr):
         return None
 
     description = pr.get("description") or ""
     previous_id = _previous_pr_id(description)
     if not previous_id:
         return (
-            "PR направлен в master, но в описании нет ссылки на предыдущий PR в "
-            "develop. По регламенту изменения сначала вливаются в develop, а затем "
-            "отбираются в master отдельным PR со ссылкой на исходный PR."
+            "PR запрещён: направлен в master, но в описании нет ссылки на "
+            "предыдущий PR в develop. По регламенту изменения сначала вливаются "
+            "в develop, а затем отбираются в master отдельным PR со ссылкой на "
+            "исходный PR."
         )
 
     current_source = _branch_short(pr.get("sourceRefName"))
@@ -120,11 +127,102 @@ def _master_pr_issue(alm: AlmClient, pr: dict):
     previous_source = _branch_short(previous.get("sourceRefName"))
     if current_source and previous_source and current_source == previous_source:
         return (
-            f"PR в master сделан из той же ветки «{current_source}», что и "
+            f"PR запрещён: сделан из той же ветки «{current_source}», что и "
             f"предыдущий PR #{previous_id} в develop. В master изменения должны "
             f"отбираться отдельной веткой, а не напрямую из личной/фича-ветки."
         )
     return None
+
+
+def _apply_master_rule(parsed: dict, issue: str, log) -> dict:
+    """Принудительно ставит forbidden, если передан текст нарушения.
+
+    Страховка поверх промпта: даже если модель не заметила нарушение, PR не
+    может быть одобрен. Возвращает изменённый parsed.
+    """
+    if not issue:
+        return parsed
+
+    log.warning("    %s", issue)
+    parsed["verdict"] = "forbidden"
+    parsed_comments = parsed.setdefault("comments", [])
+    if not any(
+        c.get("file") == "PR description" and issue in (c.get("text") or "")
+        for c in parsed_comments
+    ):
+        parsed_comments.append(
+            {
+                "file": "PR description",
+                "line": None,
+                "severity": "critical",
+                "text": issue,
+            }
+        )
+    summary = (parsed.get("summary") or "").strip()
+    if issue not in summary:
+        parsed["summary"] = (summary + "\n\n" + issue).strip()
+    return parsed
+
+
+def _clamp_forbidden(parsed: dict, pr: dict, log) -> dict:
+    """forbidden допустим только для PR в master/main; иначе понижаем вердикт."""
+    if parsed.get("verdict") == "forbidden" and not _is_master_target(pr):
+        log.warning(
+            "    Модель поставила forbidden для PR не в master — "
+            "понижаю до request_changes"
+        )
+        parsed["verdict"] = "request_changes"
+    return parsed
+
+
+def _reject_master_pr(alm: AlmClient, pr_id: int, log) -> bool:
+    """Отклонить PR голосом ревьюера -10 (только для нарушений master-правила)."""
+    try:
+        reviewer = alm.reject_pull_request(pr_id)
+        log.warning(
+            "    PR #%s отклонён голосом -10 (reviewer=%s)",
+            pr_id,
+            reviewer.get("id") or reviewer.get("uniqueName") or "?",
+        )
+        return True
+    except Exception as exc:
+        log.error(
+            "    Не удалось отклонить PR #%s голосом -10: %s", pr_id, exc
+        )
+        return False
+
+
+def _master_pr_was_rejected(alm: AlmClient, pr_id: int) -> bool:
+    """Ставил ли агент голос -10 по этому PR (по маркеру в комментарии)."""
+    try:
+        threads = alm.get_threads(pr_id).get("value", [])
+    except Exception as exc:
+        logger.warning(
+            "Не удалось проверить прежний голос по PR #%s: %s", pr_id, exc
+        )
+        return False
+    for thread in threads:
+        for comment in thread.get("comments", []):
+            if comment.get("isDeleted"):
+                continue
+            content = comment.get("content") or ""
+            if COMMENT_MARKER in content and REJECT_VOTE_RE.search(content):
+                return True
+    return False
+
+
+def _clear_master_rejection(alm: AlmClient, pr_id: int, log) -> bool:
+    """Снять голос -10, если нарушение master-правила устранено."""
+    try:
+        alm.set_pull_request_vote(pr_id, 0)
+        log.info(
+            "    Снят голос -10 по PR #%s: нарушение master-правила устранено",
+            pr_id,
+        )
+        return True
+    except Exception as exc:
+        log.error("    Не удалось снять голос -10 по PR #%s: %s", pr_id, exc)
+        return False
 
 
 def _parse_json_response(text: str):
@@ -184,7 +282,10 @@ def _describe_work_items(alm: AlmClient, pr_id: int) -> str:
 
 
 def _format_review_comment(
-    parsed: dict, reviewed_commit: str = None, target_commit: str = None
+    parsed: dict,
+    reviewed_commit: str = None,
+    target_commit: str = None,
+    rejected: bool = False,
 ) -> str:
     """Формирует markdown-текст общего комментария к PR из результата ревью.
 
@@ -196,14 +297,30 @@ def _format_review_comment(
     summary = (parsed.get("summary") or "").strip()
     comments = parsed.get("comments") or []
 
-    lines = [f"**Автоматическое ревью ({COMMENT_MARKER})**", ""]
+    lines = []
+    if verdict == "forbidden":
+        # ADO-рендерер может вырезать inline-HTML/стили, поэтому «красноту»
+        # делаем надёжными средствами Markdown: заголовок, emoji, цитата, rule.
+        lines.extend(
+            [
+                "## 🔴 PR ЗАПРЕЩЁН К ВЛИВАНИЮ",
+                "",
+                "> **Полный запрет PR.** Автоматическое ревью выявило нарушение "
+                "регламента.",
+                "> Вливать этот PR нельзя до устранения нарушения.",
+                "",
+                "---",
+                "",
+            ]
+        )
+    lines.extend([f"**Автоматическое ревью ({COMMENT_MARKER})**", ""])
     if reviewed_commit:
         commit_line = f"**Проверенный коммит:** `{reviewed_commit[:8]}`"
         if target_commit:
             commit_line += f" (target `{target_commit[:8]}`)"
         lines.append(commit_line)
         lines.append("")
-    lines.append(f"**Вердикт:** {verdict}")
+    lines.append(f"**Вердикт:** {VERDICT_LABELS.get(verdict, verdict)}")
     if summary:
         lines.append("")
         lines.append("**Резюме:**")
@@ -223,6 +340,10 @@ def _format_review_comment(
         marker = f"{COMMENT_MARKER}:reviewed_commit={reviewed_commit}"
         if target_commit:
             marker += f" reviewed_target={target_commit}"
+        if rejected:
+            # Помечаем, что голос -10 поставил именно агент: по нему потом
+            # можно безопасно снять отклонение, когда нарушение устранено.
+            marker += " vote=-10"
         lines.append("")
         lines.append(f"<!-- {marker} -->")
     return "\n".join(lines)
@@ -456,7 +577,17 @@ def _chunk_sections(sections: list, max_chars: int = MAX_BATCH_CHARS) -> list:
     return batches
 
 
-VERDICT_PRIORITY = {"request_changes": 3, "comment": 2, "approve": 1}
+VERDICT_PRIORITY = {
+    "forbidden": 4,
+    "request_changes": 3,
+    "comment": 2,
+    "approve": 1,
+}
+
+# Человекочитаемая пометка для особых вердиктов в комментарии PR.
+VERDICT_LABELS = {
+    "forbidden": "🔴 **forbidden — полный запрет PR**",
+}
 
 
 def _merge_results(parsed_list: list) -> dict:
@@ -709,10 +840,30 @@ def _review_one_pr(
     log.info("-" * 60)
     log.info("PR #%s «%s» (автор: %s)", pr_id, title, author)
     log.info("  Ветки: %s -> %s", pr.get("sourceRefName"), pr.get("targetRefName"))
+    if _is_master_target(pr):
+        log.info(
+            "    Целевая ветка master/main: проверяю ссылку на предыдущий PR "
+            "в develop и source-ветку"
+        )
 
     log.info("  Шаг 2: получаю детали PR #%s...", pr_id)
     src_commit, tgt_commit, changes = _collect_pr_changes(alm, pr_id, log)
     log.info("    Изменённых файлов: %d", len(changes))
+
+    # Нарушение регламента для PR в master проверяем ДО dedup: голос «Отклонить»
+    # должен ставиться и на уже отревьюенном PR. Голос — идемпотентный.
+    master_issue = _master_pr_issue(alm, pr)
+    rejected = False
+    if master_issue:
+        log.warning("    %s", master_issue)
+        if settings.post_comments:
+            rejected = _reject_master_pr(alm, pr_id, log)
+    elif (
+        settings.post_comments
+        and _is_master_target(pr)
+        and _master_pr_was_rejected(alm, pr_id)
+    ):
+        _clear_master_rejection(alm, pr_id, log)
 
     # Dedup по проверенному коммиту: старый комментарий не блокирует ревью,
     # если после него человек запушил новые коммиты (только в режиме постинга).
@@ -770,31 +921,13 @@ def _review_one_pr(
                 "verdict": "parse_error",
                 "latency_ms": llm_latency_ms,
                 "tokens": llm_tokens,
+                "rejected": rejected,
             }
 
-    # Страховка поверх промпта: PR в master без ссылки на предыдущий PR в
-    # develop не может быть одобрен, даже если модель это пропустила.
-    master_issue = _master_pr_issue(alm, pr)
-    if master_issue:
-        log.warning("    %s", master_issue)
-        parsed["verdict"] = "request_changes"
-        parsed_comments = parsed.setdefault("comments", [])
-        if not any(
-            c.get("file") == "PR description"
-            and master_issue in (c.get("text") or "")
-            for c in parsed_comments
-        ):
-            parsed_comments.append(
-                {
-                    "file": "PR description",
-                    "line": None,
-                    "severity": "critical",
-                    "text": master_issue,
-                }
-            )
-        summary = (parsed.get("summary") or "").strip()
-        if master_issue not in summary:
-            parsed["summary"] = (summary + "\n\n" + master_issue).strip()
+    # Страховка поверх промпта: нарушение регламента в PR к master переводит
+    # вердикт в forbidden (полный запрет), даже если модель это пропустила.
+    parsed = _apply_master_rule(parsed, master_issue, log)
+    parsed = _clamp_forbidden(parsed, pr, log)
 
     verdict = parsed.get("verdict", "?")
     summary = parsed.get("summary", "")
@@ -806,7 +939,9 @@ def _review_one_pr(
     if settings.post_comments:
         log.info("    Отправляю резюме в PR как комментарий...")
         try:
-            comment_text = _format_review_comment(parsed, src_commit, tgt_commit)
+            comment_text = _format_review_comment(
+                parsed, src_commit, tgt_commit, rejected
+            )
             thread = alm.create_thread_comment(pr_id, comment_text)
             log.info("    Комментарий создан, thread id=%s", thread.get("id"))
         except Exception as exc:
@@ -825,6 +960,7 @@ def _review_one_pr(
         "comments": comments,
         "latency_ms": llm_latency_ms,
         "tokens": llm_tokens,
+        "rejected": rejected,
     }
 
 

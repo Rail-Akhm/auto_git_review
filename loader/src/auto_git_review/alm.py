@@ -30,6 +30,7 @@ class AlmClient:
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth("", self.settings.azure_pat)
         self.session.verify = self.settings.verify_ssl
+        self._authenticated_user_id = None
 
     def _url(self, path: str) -> str:
         """URL project-scoped эндпоинта: /{collection}/{project}/_apis/..."""
@@ -53,6 +54,16 @@ class AlmClient:
         p.setdefault("api-version", self.settings.api_version)
         resp = self.session.get(self._url_collection(path), params=p, timeout=60)
         resp.raise_for_status()
+        return resp.json()
+
+    def _put(self, path: str, body: dict, params=None) -> dict:
+        """PUT к project-scoped эндпоинту; добавляет api-version в параметры."""
+        p = dict(params or {})
+        p.setdefault("api-version", self.settings.api_version)
+        resp = self.session.put(self._url(path), params=p, json=body, timeout=60)
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            return {}
         return resp.json()
 
     def list_open_pull_requests(self, repo: str = None) -> dict:
@@ -185,6 +196,34 @@ class AlmClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    def get_authenticated_user_id(self) -> str:
+        """ID пользователя PAT (от его имени ставится голос ревьюера)."""
+        if self._authenticated_user_id:
+            return self._authenticated_user_id
+        data = self._get_collection("_apis/connectionData")
+        user = data.get("authenticatedUser") or {}
+        user_id = user.get("id")
+        if not user_id:
+            raise RuntimeError(
+                "Не удалось определить пользователя PAT (connectionData)"
+            )
+        self._authenticated_user_id = user_id
+        return user_id
+
+    def set_pull_request_vote(self, pr_id: int, vote: int, repo: str = None) -> dict:
+        """Голос ревьюера по PR: 10 — approve, 0 — нейтрально, -10 — отклонён."""
+        repo = repo or self.settings.azure_repo
+        reviewer_id = self.get_authenticated_user_id()
+        return self._put(
+            f"_apis/git/repositories/{repo}/pullRequests/{pr_id}"
+            f"/reviewers/{reviewer_id}",
+            {"vote": vote},
+        )
+
+    def reject_pull_request(self, pr_id: int, repo: str = None) -> dict:
+        """Отклонить PR голосом -10 (в UI Azure DevOps — «Отклонить»)."""
+        return self.set_pull_request_vote(pr_id, -10, repo=repo)
 
     def get_file_commits(
         self, path: str, target_version: str, top: int = 5, repo: str = None
