@@ -223,6 +223,105 @@ def test_parse_iso_datetime_handles_seven_fraction_digits():
     assert review._parse_iso_datetime("not-a-date") is None
 
 
+def test_previous_pr_id_from_ado_link_and_text():
+    assert (
+        review._previous_pr_id(
+            "Выборочно отобрано из Запрос на вытягивание 161341: fix"
+        )
+        == 161341
+    )
+    assert (
+        review._previous_pr_id(
+            "https://alm.example/TFS/GPN/P/_git/repo/pullrequest/161341"
+        )
+        == 161341
+    )
+    assert review._previous_pr_id("PR #42") == 42
+    assert review._previous_pr_id("нет ссылки на предыдущий PR") is None
+
+
+class _PreviousPrAlm:
+    """ALM-заглушка: отдаёт source-ветку предыдущего PR."""
+
+    def __init__(self, source):
+        self._source = source
+
+    def get_pull_request(self, pr_id):
+        return {"sourceRefName": self._source}
+
+
+def test_master_pr_issue_requires_previous_pr_link():
+    pr = {"targetRefName": "refs/heads/master", "description": "fix"}
+    issue = review._master_pr_issue(None, pr)
+    assert issue and "master" in issue
+
+    pr["description"] = "Выборочно отобрано из Запрос на вытягивание 161341: fix"
+    assert review._master_pr_issue(_PreviousPrAlm("refs/heads/feature"), pr) is None
+
+    pr["targetRefName"] = "refs/heads/main"
+    pr["description"] = ""
+    assert review._master_pr_issue(None, pr)
+
+    # PR в develop — правило не применяется.
+    pr["targetRefName"] = "refs/heads/develop"
+    pr["description"] = "fix"
+    assert review._master_pr_issue(None, pr) is None
+
+
+def test_master_pr_issue_detects_same_feature_branch():
+    pr = {
+        "targetRefName": "refs/heads/master",
+        "sourceRefName": "refs/heads/serv_1810",
+        "description": "Выборочно отобрано из Запрос на вытягивание 161341",
+    }
+    issue = review._master_pr_issue(_PreviousPrAlm("refs/heads/serv_1810"), pr)
+    assert issue and "той же ветки" in issue
+
+    # Отдельная ветка отбора — нарушения нет.
+    pr["sourceRefName"] = "refs/heads/master_selection"
+    assert review._master_pr_issue(_PreviousPrAlm("refs/heads/serv_1810"), pr) is None
+
+
+class _CapturingLlm:
+    def __init__(self):
+        self.messages = None
+
+    def chat(self, messages):
+        self.messages = messages
+        return {
+            "content": _VALID_REVIEW,
+            "reasoning": "",
+            "usage": {"total_tokens": 1},
+            "latency_ms": 1,
+            "model": "qwen3.8-27b-fp8",
+            "fallback_used": False,
+            "finish_reason": "stop",
+        }
+
+
+def test_review_batches_renders_pr_metadata_into_prompt():
+    llm = _CapturingLlm()
+    review._review_pr_batches(
+        llm,
+        "target=[[PR_TARGET]] source=[[PR_SOURCE]] title=[[PR_TITLE]] "
+        "desc=[[PR_DESCRIPTION]] files=[[FILES]]",
+        [["f1"]],
+        "wi",
+        logging.getLogger("test"),
+        pr_meta={
+            "target": "refs/heads/master",
+            "source": "refs/heads/serv_1810",
+            "title": "fix",
+            "description": "Запрос на вытягивание 161341",
+        },
+    )
+    text = llm.messages[0]["content"]
+    assert "target=refs/heads/master" in text
+    assert "source=refs/heads/serv_1810" in text
+    assert "desc=Запрос на вытягивание 161341" in text
+    assert "files=f1" in text
+
+
 def test_already_reviewed_alm_error_skips_to_avoid_duplicate():
     assert review._already_reviewed(_BrokenAlm(), 1, "a" * 40) is True
 

@@ -60,6 +60,72 @@ VISIBLE_COMMITS_RE = re.compile(
     r"(?:\s*\(target\s*`([0-9a-fA-F]{7,40})`\))?"
 )
 
+# Ветки, для PR в которые действует правило «ссылка на предыдущий PR в develop».
+MASTER_BRANCHES = {"master", "main"}
+
+# Ссылка/упоминание предыдущего PR в описании: URL .../pullrequest/<id>,
+# «Запрос на вытягивание <id>», «PR #<id>», «Pull Request <id>».
+PREVIOUS_PR_LINK_RE = re.compile(
+    r"/pullrequests?/(\d+)"
+    r"|запрос на вытягивание\s*#?\s*(\d+)"
+    r"|\bpull request\s*#?\s*(\d+)"
+    r"|\bPR\s*#?\s*(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _branch_short(ref: str) -> str:
+    """`refs/heads/master` -> `master`."""
+    return (ref or "").rstrip("/").rsplit("/", 1)[-1].lower()
+
+
+def _previous_pr_id(description: str):
+    """ID предыдущего PR из описания (любая поддерживаемая форма ссылки)."""
+    match = PREVIOUS_PR_LINK_RE.search(description or "")
+    if not match:
+        return None
+    return next((int(group) for group in match.groups() if group), None)
+
+
+def _master_pr_issue(alm: AlmClient, pr: dict):
+    """Нарушение регламента для PR в master или None, если всё в порядке.
+
+    Проверяется: (1) в описании есть ссылка на предыдущий PR в develop;
+    (2) source-ветка не совпадает с веткой предыдущего develop-PR — иначе это
+    PR напрямую из личной/фича-ветки, а не отдельный отбор изменений.
+    """
+    if _branch_short(pr.get("targetRefName")) not in MASTER_BRANCHES:
+        return None
+
+    description = pr.get("description") or ""
+    previous_id = _previous_pr_id(description)
+    if not previous_id:
+        return (
+            "PR направлен в master, но в описании нет ссылки на предыдущий PR в "
+            "develop. По регламенту изменения сначала вливаются в develop, а затем "
+            "отбираются в master отдельным PR со ссылкой на исходный PR."
+        )
+
+    current_source = _branch_short(pr.get("sourceRefName"))
+    try:
+        previous = alm.get_pull_request(previous_id)
+    except Exception as exc:
+        logger.warning(
+            "Не удалось получить предыдущий PR #%s для проверки ветки: %s",
+            previous_id,
+            exc,
+        )
+        return None
+
+    previous_source = _branch_short(previous.get("sourceRefName"))
+    if current_source and previous_source and current_source == previous_source:
+        return (
+            f"PR в master сделан из той же ветки «{current_source}», что и "
+            f"предыдущий PR #{previous_id} в develop. В master изменения должны "
+            f"отбираться отдельной веткой, а не напрямую из личной/фича-ветки."
+        )
+    return None
+
 
 def _parse_json_response(text: str):
     """Толерантный разбор JSON из ответа модели (модель может оборачивать в markdown)."""
@@ -470,9 +536,17 @@ class LlmResponseError(RuntimeError):
 
 
 def _review_pr_batches(
-    llm: LlmClient, prompt_template: str, batches: list, work_items_text: str, log
+    llm: LlmClient,
+    prompt_template: str,
+    batches: list,
+    work_items_text: str,
+    log,
+    pr_meta: dict = None,
 ) -> tuple:
     """Ревью одного PR по батчам: вызов LLM на каждый батч и агрегация результата.
+
+    ``pr_meta`` — target/source/заголовок/описание PR: по ним промпт проверяет
+    правило для PR в master (ссылка на предыдущий PR в develop).
 
     Возвращает кортеж (parsed, total_latency_ms, total_tokens):
       - parsed — итоговый dict (verdict + summary + comments);
@@ -489,6 +563,7 @@ def _review_pr_batches(
     parsed_batches = []
     total_latency_ms = 0
     total_tokens = 0
+    pr_meta = pr_meta or {}
     for bi, batch in enumerate(batches, start=1):
         files_text = "\n".join(batch)
         messages = [
@@ -498,6 +573,10 @@ def _review_pr_batches(
                     prompt_template,
                     work_item=work_items_text,
                     files=files_text,
+                    pr_target=pr_meta.get("target", ""),
+                    pr_source=pr_meta.get("source", ""),
+                    pr_title=pr_meta.get("title", ""),
+                    pr_description=pr_meta.get("description", ""),
                 ),
             }
         ]
@@ -620,6 +699,12 @@ def _review_one_pr(
     pr_id = pr["pullRequestId"]
     title = pr.get("title", "")
     author = pr.get("createdBy", {}).get("displayName", "?")
+    pr_meta = {
+        "target": pr.get("targetRefName", ""),
+        "source": pr.get("sourceRefName", ""),
+        "title": title,
+        "description": _truncate(pr.get("description") or "", 20000),
+    }
     started = time.monotonic()
     log.info("-" * 60)
     log.info("PR #%s «%s» (автор: %s)", pr_id, title, author)
@@ -674,7 +759,7 @@ def _review_one_pr(
     else:
         log.info("  Шаг 5: вызываю LLM (%s) по каждому батчу...", settings.llm_model)
         parsed, llm_latency_ms, llm_tokens = _review_pr_batches(
-            llm, prompt_template, batches, work_items_text, log
+            llm, prompt_template, batches, work_items_text, log, pr_meta=pr_meta
         )
         if parsed is None:
             log.warning(
@@ -686,6 +771,30 @@ def _review_one_pr(
                 "latency_ms": llm_latency_ms,
                 "tokens": llm_tokens,
             }
+
+    # Страховка поверх промпта: PR в master без ссылки на предыдущий PR в
+    # develop не может быть одобрен, даже если модель это пропустила.
+    master_issue = _master_pr_issue(alm, pr)
+    if master_issue:
+        log.warning("    %s", master_issue)
+        parsed["verdict"] = "request_changes"
+        parsed_comments = parsed.setdefault("comments", [])
+        if not any(
+            c.get("file") == "PR description"
+            and master_issue in (c.get("text") or "")
+            for c in parsed_comments
+        ):
+            parsed_comments.append(
+                {
+                    "file": "PR description",
+                    "line": None,
+                    "severity": "critical",
+                    "text": master_issue,
+                }
+            )
+        summary = (parsed.get("summary") or "").strip()
+        if master_issue not in summary:
+            parsed["summary"] = (summary + "\n\n" + master_issue).strip()
 
     verdict = parsed.get("verdict", "?")
     summary = parsed.get("summary", "")

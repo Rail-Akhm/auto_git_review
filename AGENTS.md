@@ -36,7 +36,7 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
   262 144 токена; рабочее допущение — 250k. 35b-a3b быстрее на ~20% при 8k и на
   ~40% при 32k, но для ревью выбрана 3.8-27B как более сильная в reasoning;
   переключение на запасную автоматическое.
-- 70 unit-тестов в `loader/src/auto_git_review/tests/` покрывают чистую логику
+- 74 unit-теста в `loader/src/auto_git_review/tests/` покрывают чистую логику
   (без обращений к ALM/LLM); запускаются `pytest` из корня проекта.
 - Папка `auto_git_review_research/` — комплект для подачи на валидацию
   (ноутбук со встроенным production-кодом, README, ответ на замечания, отчёт
@@ -78,6 +78,14 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
   («thinking»-модели иногда оставляют итог только там), затем вызов повторяется
   один раз. Если разобрать не удалось — `LlmResponseError`, задача падает с
   диагностикой (`finish_reason`, `completion_tokens`, размеры полей).
+- **Правило PR в master.** Если target — `master`/`main`, в описании PR
+  обязательна ссылка на предыдущий PR в develop (URL `/pullrequest/<id>` или
+  «Запрос на вытягивание <id>»); source-ветка должна быть отдельной веткой
+  отбора, не личной/фича-веткой. Правило прописано во всех промптах; в
+  `review.py` `_master_pr_issue()` детерминированно принуждает
+  `request_changes` с critical-замечанием, если ссылки нет или source-ветка
+  совпадает с веткой предыдущего PR в develop. Для develop-PR правило не
+  действует.
 - **Dedup — по маркеру, а не по автору.** `COMMENT_MARKER = "auto_git_review"`
   ищется в тексте комментариев PR **до** вызова LLM: владелец PAT — реальный
   пользователь, у него есть и свои комментарии. В комментарий пишется SHA
@@ -137,7 +145,7 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                   # все 70 тестов
+pytest                                   # все 74 теста
 pytest loader/src/auto_git_review/tests/test_alm.py
 pytest -k test_decode_content
 ```
