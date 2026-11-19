@@ -225,6 +225,33 @@ class AlmClient:
         """Отклонить PR голосом -10 (в UI Azure DevOps — «Отклонить»)."""
         return self.set_pull_request_vote(pr_id, -10, repo=repo)
 
+    def get_pull_request_reviewers(self, pr_id: int, repo: str = None) -> dict:
+        """Рецензенты PR и их голоса."""
+        repo = repo or self.settings.azure_repo
+        return self._get(
+            f"_apis/git/repositories/{repo}/pullRequests/{pr_id}/reviewers"
+        )
+
+    def get_my_vote(self, pr_id: int, repo: str = None):
+        """Текущий голос пользователя PAT по PR (None — голоса нет/не найден)."""
+        reviewers = self.get_pull_request_reviewers(pr_id, repo=repo).get(
+            "value", []
+        )
+        my_id = self.get_authenticated_user_id().lower()
+        for reviewer in reviewers:
+            reviewer_id = reviewer.get("id") or (
+                reviewer.get("identity") or {}
+            ).get("id")
+            if (reviewer_id or "").lower() == my_id:
+                vote = reviewer.get("vote")
+                if vote is None:
+                    return None
+                try:
+                    return int(vote)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
     def get_file_commits(
         self, path: str, target_version: str, top: int = 5, repo: str = None
     ) -> dict:

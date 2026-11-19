@@ -70,6 +70,26 @@ def test_reject_pull_request_sets_minus_10_vote():
     assert kwargs["json"] == {"vote": -10}
 
 
+def test_get_my_vote_finds_authenticated_reviewer():
+    client = AlmClient(_settings())
+    client.get_authenticated_user_id = MagicMock(return_value="User-1")
+    client._get = MagicMock(
+        return_value={"value": [{"id": "user-1", "vote": -10}]}
+    )
+    assert client.get_my_vote(123) == -10
+
+    client._get = MagicMock(
+        return_value={"value": [{"id": "other", "vote": 10}]}
+    )
+    assert client.get_my_vote(123) is None
+
+    # ADO может отдать vote строкой — приводим к int.
+    client._get = MagicMock(
+        return_value={"value": [{"id": "user-1", "vote": "-10"}]}
+    )
+    assert client.get_my_vote(123) == -10
+
+
 def _fake_response(payload):
     resp = MagicMock()
     resp.json.return_value = payload

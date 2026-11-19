@@ -164,6 +164,47 @@ def test_clear_master_rejection_sets_zero_vote():
     ) is False
 
 
+class _RuleCommentAlm:
+    def __init__(self):
+        self.created = []
+
+    def get_threads(self, pr_id):
+        return {
+            "value": [
+                {
+                    "comments": [
+                        {"content": content, "isDeleted": False}
+                        for content in self.created
+                    ]
+                }
+            ]
+        }
+
+    def create_thread_comment(self, pr_id, content):
+        self.created.append(content)
+        return {"id": len(self.created)}
+
+
+def test_post_master_rule_comment_posts_once():
+    alm = _RuleCommentAlm()
+    issue = "PR запрещён: тестовое нарушение"
+    log = logging.getLogger("test")
+
+    assert review._post_master_rule_comment(
+        alm, 1, issue, "a" * 40, "c" * 40, True, log
+    ) is True
+    assert len(alm.created) == 1
+    assert "🔴 PR ЗАПРЕЩЁН К ВЛИВАНИЮ" in alm.created[0]
+    assert "master_rule=" in alm.created[0]
+    assert "vote=-10" in alm.created[0]
+
+    # Повторный прогон не дублирует объяснение.
+    assert review._post_master_rule_comment(
+        alm, 1, issue, "a" * 40, "c" * 40, True, log
+    ) is False
+    assert len(alm.created) == 1
+
+
 def test_merge_results_summary_multiple_parts():
     parsed = [
         {"verdict": "approve", "summary": "A"},
@@ -366,14 +407,99 @@ def test_previous_pr_id_from_ado_link_and_text():
     assert review._previous_pr_id("нет ссылки на предыдущий PR") is None
 
 
+def test_previous_pr_id_parses_html_description():
+    # ADO отдаёт описание в HTML: ссылка может быть в href, а число — в теге.
+    assert (
+        review._previous_pr_id(
+            'Выборочно отобрано из <a href="https://alm.example/TFS/GPN/P/_git/'
+            'repo/pullrequest/160772">Запрос на вытягивание 160772</a>'
+        )
+        == 160772
+    )
+    assert (
+        review._previous_pr_id("Запрос на вытягивание <span>160772</span>")
+        == 160772
+    )
+    # Автотекст ALM: «Выборочно отобрано из ...» (ссылка может быть в теге).
+    assert (
+        review._previous_pr_id(
+            "Выборочно отобрано из Запрос на вытягивание 160772: fix"
+        )
+        == 160772
+    )
+    assert (
+        review._previous_pr_id('Выборочно отобрано из <a href="#">160772</a>')
+        == 160772
+    )
+    assert (
+        review._previous_pr_id(
+            "Выборочно отобрано из <a href='#'>какой-то заголовок</a> 160772"
+        )
+        == 160772
+    )
+    assert (
+        review._previous_pr_id(
+            "Выборочно отобрано из: Запрос на вытягивание № 160772"
+        )
+        == 160772
+    )
+    # Второй формат автотекста ALM: cherry-pick в master.
+    assert (
+        review._previous_pr_id(
+            "Cherry picked from Запрос на вытягивание 160200: feat"
+        )
+        == 160200
+    )
+    assert (
+        review._previous_pr_id("Cherry picked from <a href='#'>160200</a>")
+        == 160200
+    )
+
+
+def test_master_pr_issue_accepts_selection_branch():
+    # Реальный кейс: master-PR из отдельной ветки отбора, develop-PR — из фичи.
+    pr = {
+        "targetRefName": "refs/heads/master",
+        "sourceRefName": "refs/heads/IMPORTXDBI-1517-on-master",
+        "description": "Выборочно отобрано из Запрос на вытягивание 160772",
+    }
+    assert (
+        review._master_pr_issue(
+            _PreviousPrAlm("refs/heads/IMPORTXDBI-1517"), pr
+        )
+        is None
+    )
+
+
+def test_master_pr_issue_finds_link_in_commit_message():
+    # Описание в API может быть без автотекста — ссылка есть в сообщении коммита.
+    pr = {
+        "targetRefName": "refs/heads/master",
+        "sourceRefName": "refs/heads/IMPORTXDBI-1517-on-master",
+        "description": "",
+        "lastMergeSourceCommit": {"commitId": "abc12345"},
+    }
+    alm = _PreviousPrAlm(
+        "refs/heads/IMPORTXDBI-1517",
+        commit_message="Cherry picked from Запрос на вытягивание 160200: feat",
+    )
+    assert review._master_pr_issue(alm, pr) is None
+
+
 class _PreviousPrAlm:
     """ALM-заглушка: отдаёт source-ветку предыдущего PR."""
 
-    def __init__(self, source):
+    def __init__(self, source, commit_message=None):
         self._source = source
+        self._commit_message = commit_message
 
     def get_pull_request(self, pr_id):
         return {"sourceRefName": self._source}
+
+    def get_commit(self, commit_id):
+        if self._commit_message is None:
+            raise ConnectionError("commit unavailable")
+        return {"comment": self._commit_message}
 
 
 def test_master_pr_issue_blocks_direct_test_branch():
@@ -479,12 +605,13 @@ def test_collect_pr_changes_prefers_iteration_source_commit():
         "changeEntries": [{"item": {"path": "/a.sql"}}]
     }
 
-    src, tgt, changes = review._collect_pr_changes(
+    src, tgt, changes, detail = review._collect_pr_changes(
         alm, 1, logging.getLogger("test")
     )
     assert src == "new"
     assert tgt == "target"
     assert changes == [{"item": {"path": "/a.sql"}}]
+    assert detail["lastMergeSourceCommit"]["commitId"] == "old"
     alm.get_pr_iteration_changes.assert_called_once_with(1, 2)
 
 

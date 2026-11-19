@@ -1,6 +1,8 @@
 """Основная функция ревью: единый проход по всем открытым PR с подробным логированием."""
 
 import difflib
+import hashlib
+import html as html_lib
 import json
 import logging
 import re
@@ -69,7 +71,10 @@ MASTER_BRANCHES = {"master", "main"}
 PREVIOUS_PR_LINK_RE = re.compile(
     r"/pullrequests?/(\d+)"
     r"|pullrequestid=(\d+)"
-    r"|запрос на вытягивание\s*#?\s*(\d+)"
+    r"|(?:выборочно отобрано из|cherry picked from)\s*:?\s*"
+    r"(?:запрос на вытягивание\s*[№#]?\s*)?(\d{5,8})"
+    r"|(?:выборочно отобрано из|cherry picked from)[^\n]{0,300}?(\d{5,8})"
+    r"|запрос на вытягивание[^\n]{0,80}?(\d{4,8})"
     r"|\bpull request\s*#?\s*(\d+)"
     r"|\bPR\s*#?\s*(\d+)",
     re.IGNORECASE,
@@ -81,9 +86,22 @@ def _branch_short(ref: str) -> str:
     return (ref or "").rstrip("/").rsplit("/", 1)[-1].lower()
 
 
+def _plain_text(value: str) -> str:
+    """HTML описания PR -> текст без тегов (ссылки ADO приходят как <a>)."""
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    return html_lib.unescape(text)
+
+
 def _previous_pr_id(description: str):
-    """ID предыдущего PR из описания (любая поддерживаемая форма ссылки)."""
-    match = PREVIOUS_PR_LINK_RE.search(description or "")
+    """ID предыдущего PR из описания (любая поддерживаемая форма ссылки).
+
+    Проверяем и сырой текст (URL в href), и текст без HTML-тегов — ADO отдаёт
+    описание в HTML, и «Запрос на вытягивание <a>160772</a>» иначе не матчится.
+    """
+    text = description or ""
+    match = PREVIOUS_PR_LINK_RE.search(text)
+    if not match:
+        match = PREVIOUS_PR_LINK_RE.search(_plain_text(text))
     if not match:
         return None
     return next((int(group) for group in match.groups() if group), None)
@@ -105,6 +123,28 @@ def _master_pr_issue(alm: AlmClient, pr: dict):
 
     description = pr.get("description") or ""
     previous_id = _previous_pr_id(description)
+    if not previous_id:
+        # Описание в API может не содержать автотекст ALM — тогда ищем тот же
+        # «Cherry picked from …» в сообщении source-коммита.
+        commit_id = (pr.get("lastMergeSourceCommit") or {}).get("commitId")
+        if commit_id:
+            try:
+                commit = alm.get_commit(commit_id)
+                previous_id = _previous_pr_id(commit.get("comment") or "")
+                if previous_id:
+                    logger.info(
+                        "Ссылка на предыдущий PR #%s найдена в сообщении "
+                        "коммита %s",
+                        previous_id,
+                        commit_id[:8],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Не удалось прочитать сообщение коммита %s: %s",
+                    commit_id,
+                    exc,
+                )
+
     if not previous_id:
         return (
             "PR запрещён: направлен в master, но в описании нет ссылки на "
@@ -222,6 +262,78 @@ def _clear_master_rejection(alm: AlmClient, pr_id: int, log) -> bool:
         return True
     except Exception as exc:
         log.error("    Не удалось снять голос -10 по PR #%s: %s", pr_id, exc)
+        return False
+
+
+def _master_rule_comment_exists(alm: AlmClient, pr_id: int, marker: str) -> bool:
+    """Есть ли уже комментарий агента с таким маркером master-правила."""
+    try:
+        threads = alm.get_threads(pr_id).get("value", [])
+    except Exception as exc:
+        logger.warning(
+            "Не удалось проверить комментарии master-правила PR #%s: %s",
+            pr_id,
+            exc,
+        )
+        return False
+    for thread in threads:
+        for comment in thread.get("comments", []):
+            if comment.get("isDeleted"):
+                continue
+            if marker in (comment.get("content") or ""):
+                return True
+    return False
+
+
+def _post_master_rule_comment(
+    alm: AlmClient,
+    pr_id: int,
+    issue: str,
+    src_commit: str,
+    tgt_commit: str,
+    rejected: bool,
+    log,
+) -> bool:
+    """Опубликовать объяснение запрета, если код PR уже отревьюен (dedup).
+
+    Отдельный комментарий с красным блоком и маркером master_rule, чтобы голос
+    -10 не появлялся в PR без объяснения и не дублировался при каждом прогоне.
+    """
+    rule_hash = hashlib.sha1(
+        f"{issue}|{src_commit or ''}".encode("utf-8")
+    ).hexdigest()[:12]
+    marker = f"{COMMENT_MARKER}:master_rule={rule_hash}"
+    if _master_rule_comment_exists(alm, pr_id, marker):
+        return False
+
+    parsed = {
+        "verdict": "forbidden",
+        "summary": issue,
+        "comments": [
+            {
+                "file": "PR description",
+                "line": None,
+                "severity": "critical",
+                "text": issue,
+            }
+        ],
+    }
+    text = _format_review_comment(parsed, src_commit, tgt_commit, rejected)
+    text += f"\n<!-- {marker} -->"
+    try:
+        thread = alm.create_thread_comment(pr_id, text)
+        log.warning(
+            "    Опубликовано объяснение запрета PR #%s (thread=%s)",
+            pr_id,
+            thread.get("id"),
+        )
+        return True
+    except Exception as exc:
+        log.error(
+            "    Не удалось опубликовать объяснение запрета PR #%s: %s",
+            pr_id,
+            exc,
+        )
         return False
 
 
@@ -609,9 +721,10 @@ def _merge_results(parsed_list: list) -> dict:
 
 
 def _collect_pr_changes(alm: AlmClient, pr_id: int, log) -> tuple:
-    """Возвращает (source_commit, target_commit, changes) для PR.
+    """Возвращает (source_commit, target_commit, changes, detail) для PR.
 
-    changes — список изменённых файлов последней итерации (changeEntries).
+    detail — полные детали PR из API (в списке открытых PR описание может быть
+    неполным). changes — список изменённых файлов последней итерации.
     При отсутствии коммитов или ошибке список changes остаётся пустым.
     """
     detail = alm.get_pull_request(pr_id)
@@ -646,7 +759,7 @@ def _collect_pr_changes(alm: AlmClient, pr_id: int, log) -> tuple:
     if not src_commit or not tgt_commit:
         log.warning("    Нет коммитов для diff, изменения не собираются.")
         changes = []
-    return src_commit, tgt_commit, changes
+    return src_commit, tgt_commit, changes, detail
 
 
 class LlmUnavailableError(RuntimeError):
@@ -830,15 +943,33 @@ def _review_one_pr(
     pr_id = pr["pullRequestId"]
     title = pr.get("title", "")
     author = pr.get("createdBy", {}).get("displayName", "?")
+    started = time.monotonic()
+    log.info("-" * 60)
+    log.info("PR #%s «%s» (автор: %s)", pr_id, title, author)
+
+    log.info("  Шаг 2: получаю детали PR #%s...", pr_id)
+    src_commit, tgt_commit, changes, detail = _collect_pr_changes(alm, pr_id, log)
+    log.info("    Изменённых файлов: %d", len(changes))
+
+    # В ответе списка открытых PR описание может быть неполным — берём
+    # актуальные target/source/title/description из деталей PR.
+    for key in (
+        "description",
+        "targetRefName",
+        "sourceRefName",
+        "title",
+        "lastMergeSourceCommit",
+        "lastMergeTargetCommit",
+    ):
+        if detail.get(key):
+            pr[key] = detail[key]
+    title = pr.get("title") or title
     pr_meta = {
         "target": pr.get("targetRefName", ""),
         "source": pr.get("sourceRefName", ""),
         "title": title,
         "description": _truncate(pr.get("description") or "", 20000),
     }
-    started = time.monotonic()
-    log.info("-" * 60)
-    log.info("PR #%s «%s» (автор: %s)", pr_id, title, author)
     log.info("  Ветки: %s -> %s", pr.get("sourceRefName"), pr.get("targetRefName"))
     if _is_master_target(pr):
         log.info(
@@ -846,18 +977,53 @@ def _review_one_pr(
             "в develop и source-ветку"
         )
 
-    log.info("  Шаг 2: получаю детали PR #%s...", pr_id)
-    src_commit, tgt_commit, changes = _collect_pr_changes(alm, pr_id, log)
-    log.info("    Изменённых файлов: %d", len(changes))
+    # Dedup по проверенному коммиту (только в режиме постинга).
+    already = settings.post_comments and _already_reviewed(alm, pr_id, src_commit)
 
-    # Нарушение регламента для PR в master проверяем ДО dedup: голос «Отклонить»
-    # должен ставиться и на уже отревьюенном PR. Голос — идемпотентный.
+    # Нарушение регламента для PR в master проверяем ДО пропуска: голос
+    # «Отклонить» должен ставиться и на уже отревьюенном PR.
     master_issue = _master_pr_issue(alm, pr)
     rejected = False
+
+    # Если PR уже отклонён (голос -10), новые комментарии не публикуем:
+    # иначе на каждый прогон появляется ещё один комментарий.
+    my_vote = None
+    vote_lookup_failed = False
+    if settings.post_comments and _is_master_target(pr):
+        try:
+            my_vote = alm.get_my_vote(pr_id)
+        except Exception as exc:
+            vote_lookup_failed = True
+            log.warning("    Не удалось получить голос по PR #%s: %s", pr_id, exc)
+
+    rejected_before = my_vote == -10 or (
+        vote_lookup_failed and _master_pr_was_rejected(alm, pr_id)
+    )
+    if rejected_before:
+        log.info("    PR уже отклонён — новые комментарии не публикую.")
+        if not master_issue and _master_pr_was_rejected(alm, pr_id):
+            _clear_master_rejection(alm, pr_id, log)
+        return None
+
     if master_issue:
         log.warning("    %s", master_issue)
+        raw_description = pr.get("description") or ""
+        if not _previous_pr_id(raw_description):
+            # Диагностика: видно, в каком виде ALM отдал описание, если ссылка
+            # не распозналась. Помогает при разборе форматов авто-ссылок.
+            log.warning(
+                "    Ссылка на предыдущий PR не найдена; сырое описание "
+                "(первые 1000 символов): %s",
+                raw_description[:1000],
+            )
         if settings.post_comments:
             rejected = _reject_master_pr(alm, pr_id, log)
+            if already:
+                # Код уже отревьюен, новый ревью-комментарий не появится —
+                # публикуем отдельное объяснение запрета.
+                _post_master_rule_comment(
+                    alm, pr_id, master_issue, src_commit, tgt_commit, rejected, log
+                )
     elif (
         settings.post_comments
         and _is_master_target(pr)
@@ -865,9 +1031,7 @@ def _review_one_pr(
     ):
         _clear_master_rejection(alm, pr_id, log)
 
-    # Dedup по проверенному коммиту: старый комментарий не блокирует ревью,
-    # если после него человек запушил новые коммиты (только в режиме постинга).
-    if settings.post_comments and _already_reviewed(alm, pr_id, src_commit):
+    if already:
         log.info(
             "    Комментарий для коммита %s уже есть — пропускаю PR.",
             (src_commit or "?")[:8],
