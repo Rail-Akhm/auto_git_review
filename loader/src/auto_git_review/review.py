@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from .alm import AlmClient
 from .config import get_settings
@@ -48,7 +49,6 @@ COMMENT_MARKER = "auto_git_review"
 # появились ли после ревью новые коммиты (source) или уехала целевая ветка
 # (target), и нужен ли повторный проход.
 REVIEWED_COMMIT_RE = re.compile(r"reviewed_commit=([0-9a-fA-F]{7,40})")
-REVIEWED_TARGET_RE = re.compile(r"reviewed_target=([0-9a-fA-F]{7,40})")
 # Резервный разбор видимой строки — если HTML-комментарий вырежет рендерер.
 VISIBLE_COMMITS_RE = re.compile(
     r"Проверенный коммит:\*\*\s*`([0-9a-fA-F]{7,40})`"
@@ -157,23 +157,51 @@ def _format_review_comment(
     return "\n".join(lines)
 
 
+def _parse_iso_datetime(value):
+    """ISO-дата ALM -> aware datetime (UTC); None, если разобрать не удалось."""
+    if not value:
+        return None
+    text = str(value).replace("Z", "+00:00")
+    # ADO иногда отдаёт 7 знаков после точки — fromisoformat понимает до 6.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _commit_datetime(alm: AlmClient, commit_id: str):
+    """Дата source-коммита (committer.date) или None при ошибке."""
+    try:
+        data = alm.get_commit(commit_id)
+    except Exception as exc:
+        logger.warning("Не удалось получить дату коммита %s: %s", commit_id, exc)
+        return None
+    return _parse_iso_datetime(
+        (data.get("committer") or {}).get("date")
+        or (data.get("author") or {}).get("date")
+    )
+
+
 def _already_reviewed(
     alm: AlmClient,
     pr_id: int,
     source_commit: str = None,
-    target_commit: str = None,
 ) -> bool:
-    """True, если текущее состояние PR (source+target) уже отревьюено.
+    """True, если текущий source-коммит PR уже отревьюен.
 
     Проверяем по маркеру в тексте, а не по автору: владелец PAT — реальный
     пользователь, у которого могут быть и собственные комментарии. Маркер
     однозначно отделяет комментарий бота.
 
-    Если хотя бы в одном нашем комментарии записан SHA, совпадающий с текущим
-    source-коммитом (и target, если он там указан), — ревью актуально, PR
-    пропускается. Комментарий для старого коммита означает, что человек
-    докатил изменения (или уехала целевая ветка), — нужен новый проход.
-    Старые комментарии без SHA перепроверяются один раз.
+    Решение принимается по source-коммиту (то, что запушил автор PR):
+    совпал SHA — пропускаем. Движение целевой ветки само по себе повторное
+    ревью не запускает. Если SHA в комментарии нет (старый формат или маркер
+    вырезан), сравниваем время публикации комментария с датой коммита: если
+    комментарий не старше коммита, новых изменений после ревью не было.
     """
     try:
         threads = alm.get_threads(pr_id).get("value", [])
@@ -188,7 +216,8 @@ def _already_reviewed(
         return True
 
     found_marker = False
-    reviewed = []
+    reviewed_sources = []
+    latest_published = None
     for thread in threads:
         for comment in thread.get("comments", []):
             if comment.get("isDeleted"):
@@ -197,42 +226,44 @@ def _already_reviewed(
             if COMMENT_MARKER not in content:
                 continue
             found_marker = True
+            published = _parse_iso_datetime(comment.get("publishedDate"))
+            if published and (latest_published is None or published > latest_published):
+                latest_published = published
+
             src_match = REVIEWED_COMMIT_RE.search(content)
             if src_match:
-                tgt_match = REVIEWED_TARGET_RE.search(content)
-                reviewed.append(
-                    (
-                        src_match.group(1).lower(),
-                        tgt_match.group(1).lower() if tgt_match else None,
-                    )
-                )
-            else:
-                # Резерв: видимая строка «Проверенный коммит: `sha` (target `sha`)».
-                visible = VISIBLE_COMMITS_RE.search(content)
-                if visible:
-                    reviewed.append(
-                        (visible.group(1).lower(), (visible.group(2) or "").lower() or None)
-                    )
+                reviewed_sources.append(src_match.group(1).lower())
+                continue
+            # Резерв: видимая строка «Проверенный коммит: `sha` (target `sha`)».
+            visible = VISIBLE_COMMITS_RE.search(content)
+            if visible:
+                reviewed_sources.append(visible.group(1).lower())
 
     if not found_marker:
         return False
     if not source_commit:
         # Сравнивать не с чем — не рискуем отправить второй комментарий.
         return True
-    if not reviewed:
-        # Комментарий старого формата (без SHA) — перепроверим один раз.
-        return False
 
     def same_commit(left, right):
         return left == right or left.startswith(right) or right.startswith(left)
 
     source = source_commit.lower()
-    target = target_commit.lower() if target_commit else None
-    for reviewed_source, reviewed_target in reviewed:
-        if not same_commit(source, reviewed_source):
-            continue
-        if target and reviewed_target and not same_commit(target, reviewed_target):
-            continue
+    if any(same_commit(source, reviewed) for reviewed in reviewed_sources):
+        return True
+
+    # SHA не совпал или не записан: решает время. Комментарий, опубликованный
+    # не раньше коммита, означает, что новых коммитов после ревью не было.
+    commit_dt = _commit_datetime(alm, source_commit)
+    if commit_dt and latest_published and latest_published >= commit_dt:
+        logger.info(
+            "PR #%s: комментарий от %s новее source-коммита %s от %s — "
+            "новых коммитов нет, пропускаю",
+            pr_id,
+            latest_published.isoformat(),
+            source_commit[:8],
+            commit_dt.isoformat(),
+        )
         return True
     return False
 
@@ -529,9 +560,7 @@ def _review_one_pr(
 
     # Dedup по проверенному коммиту: старый комментарий не блокирует ревью,
     # если после него человек запушил новые коммиты (только в режиме постинга).
-    if settings.post_comments and _already_reviewed(
-        alm, pr_id, src_commit, tgt_commit
-    ):
+    if settings.post_comments and _already_reviewed(alm, pr_id, src_commit):
         log.info(
             "    Комментарий для коммита %s уже есть — пропускаю PR.",
             (src_commit or "?")[:8],

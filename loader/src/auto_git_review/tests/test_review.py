@@ -110,22 +110,33 @@ def test_format_review_comment_records_reviewed_commit():
 
 
 class _ThreadsAlm:
-    """ALM-заглушка: отдаёт заданные комментарии PR."""
+    """ALM-заглушка: отдаёт заданные комментарии PR и дату коммита."""
 
-    def __init__(self, contents):
+    def __init__(self, contents, published=None, commit_date=None):
         self._contents = contents
+        self._published = published
+        self._commit_date = commit_date
 
     def get_threads(self, pr_id):
         return {
             "value": [
                 {
                     "comments": [
-                        {"content": content, "isDeleted": False}
+                        {
+                            "content": content,
+                            "isDeleted": False,
+                            "publishedDate": self._published,
+                        }
                         for content in self._contents
                     ]
                 }
             ]
         }
+
+    def get_commit(self, commit_id):
+        if not self._commit_date:
+            raise ConnectionError("commit metadata unavailable")
+        return {"committer": {"date": self._commit_date}}
 
 
 class _BrokenAlm:
@@ -150,20 +161,21 @@ def test_already_reviewed_short_sha_matches():
 
 def test_already_reviewed_new_commit_triggers_review():
     content = f"<!-- {review.COMMENT_MARKER}:reviewed_commit={'a' * 40} -->"
-    assert review._already_reviewed(_ThreadsAlm([content]), 1, "b" * 40) is False
+    alm = _ThreadsAlm(
+        [content],
+        published="2026-11-19T07:00:00Z",
+        commit_date="2026-11-19T08:00:00Z",
+    )
+    assert review._already_reviewed(alm, 1, "b" * 40) is False
 
 
-def test_already_reviewed_target_moved_triggers_review():
+def test_already_reviewed_ignores_target_in_comment():
+    # target хранится справочно и сам по себе повторное ревью не запускает.
     content = (
         f"<!-- {review.COMMENT_MARKER}:reviewed_commit={'a' * 40}"
         f" reviewed_target={'c' * 40} -->"
     )
-    assert review._already_reviewed(
-        _ThreadsAlm([content]), 1, "a" * 40, "c" * 40
-    ) is True
-    assert review._already_reviewed(
-        _ThreadsAlm([content]), 1, "a" * 40, "d" * 40
-    ) is False
+    assert review._already_reviewed(_ThreadsAlm([content]), 1, "a" * 40) is True
 
 
 def test_already_reviewed_visible_line_fallback():
@@ -172,18 +184,43 @@ def test_already_reviewed_visible_line_fallback():
         f"**Автоматическое ревью ({review.COMMENT_MARKER})**\n\n"
         "**Проверенный коммит:** `aaaaaaaa` (target `cccccccc`)"
     )
-    assert review._already_reviewed(
-        _ThreadsAlm([content]), 1, "a" * 40, "c" * 40
-    ) is True
-    assert review._already_reviewed(
-        _ThreadsAlm([content]), 1, "b" * 40, "c" * 40
-    ) is False
+    assert review._already_reviewed(_ThreadsAlm([content]), 1, "a" * 40) is True
+    assert review._already_reviewed(_ThreadsAlm([content]), 1, "b" * 40) is False
 
 
-def test_already_reviewed_legacy_comment_without_sha():
-    # Комментарий старого формата: SHA нет — перепроверяем один раз.
+def test_already_reviewed_legacy_comment_newer_than_commit():
+    # Старый комментарий без SHA: комментарий опубликован после коммита —
+    # новых коммитов нет, повторное ревью не нужно.
+    content = f"**Автоматическое ревью ({review.COMMENT_MARKER})**"
+    alm = _ThreadsAlm(
+        [content],
+        published="2026-11-19T08:00:00Z",
+        commit_date="2026-11-19T07:00:00Z",
+    )
+    assert review._already_reviewed(alm, 1, "a" * 40) is True
+
+
+def test_already_reviewed_legacy_commit_after_comment():
+    content = f"**Автоматическое ревью ({review.COMMENT_MARKER})**"
+    alm = _ThreadsAlm(
+        [content],
+        published="2026-11-19T07:00:00Z",
+        commit_date="2026-11-19T08:00:00Z",
+    )
+    assert review._already_reviewed(alm, 1, "a" * 40) is False
+
+
+def test_already_reviewed_legacy_without_dates():
+    # Без SHA и без дат — перепроверяем (лучше лишнее ревью, чем пропуск).
     content = f"**Автоматическое ревью ({review.COMMENT_MARKER})**"
     assert review._already_reviewed(_ThreadsAlm([content]), 1, "a" * 40) is False
+
+
+def test_parse_iso_datetime_handles_seven_fraction_digits():
+    parsed = review._parse_iso_datetime("2026-11-19T08:00:00.1234567Z")
+    assert parsed is not None
+    assert parsed.year == 2026 and parsed.hour == 8
+    assert review._parse_iso_datetime("not-a-date") is None
 
 
 def test_already_reviewed_alm_error_skips_to_avoid_duplicate():

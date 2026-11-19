@@ -76,6 +76,11 @@ class AlmClient:
         repo = repo or self.settings.azure_repo
         return self._get(f"_apis/git/repositories/{repo}/pullrequests/{pr_id}")
 
+    def get_commit(self, commit_id: str, repo: str = None) -> dict:
+        """Детали коммита: committer.date / author.date (нужны для проверки dedup)."""
+        repo = repo or self.settings.azure_repo
+        return self._get(f"_apis/git/repositories/{repo}/commits/{commit_id}")
+
     def get_pr_work_items(self, pr_id: int, repo: str = None) -> dict:
         """Связанные с PR work items."""
         repo = repo or self.settings.azure_repo
