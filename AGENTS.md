@@ -50,6 +50,13 @@ Server 2020 Update 1.2** (on-prem, ALM): находит открытые PR, с�
 - **Устойчивость LLM:** fallback на `qwen3.8-think`; пустой ответ — JSON из
   `reasoning` + повтор; при сбое — `LlmUnavailableError`/`LlmResponseError`,
   задача падает, частичный отчёт не публикуется.
+- **Метрики в GreenPlum.** `metrics.py` пишет одну строку на сформированное
+  ревью в `prj_brddwh.serv_git_auto_review` (Connection `edw_klad-pbrddw`,
+  psycopg2): project/repo/pr_id/source_commit, review_thread_id, review_date,
+  review_verdict, content, context_chars, tokens, latency_ms, llm_latency_ms.
+  Запись best-effort; идемпотентность — delete+insert по
+  (project, repo, pr_id, source_commit). Таблица создаётся вручную; агент DDL
+  не выполняет, только `DELETE` + `INSERT`.
 - 91 unit-тест в `loader/src/auto_git_review/tests/` покрывает чистую логику
   (без обращений к ALM/LLM); запускаются `pytest` из корня проекта.
 - Папка `auto_git_review_research/` — комплект для подачи на валидацию

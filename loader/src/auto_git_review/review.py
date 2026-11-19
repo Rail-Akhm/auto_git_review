@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from .alm import AlmClient
 from .config import get_settings
 from .llm import LlmClient
+from .metrics import record_review
 from .monitoring import emit_summary, summarize
 from .prompt import load_prompt, render_prompt
 
@@ -1051,6 +1052,8 @@ def _review_one_pr(
         log.warning("    Изменения не получены — ревью пропущено.")
         return None
 
+    context_chars = sum(len("\n".join(batch)) for batch in batches)
+
     llm_latency_ms = 0
     llm_tokens = 0
     if len(batches) > max_batches:
@@ -1100,23 +1103,29 @@ def _review_one_pr(
     log.info("    Резюме: %s", summary)
     log.info("    Комментариев: %d", len(comments))
 
+    comment_text = _format_review_comment(
+        parsed, src_commit, tgt_commit, rejected
+    )
+    content_chars = len(comment_text)
+    review_thread_id = None
     if settings.post_comments:
         log.info("    Отправляю резюме в PR как комментарий...")
         try:
-            comment_text = _format_review_comment(
-                parsed, src_commit, tgt_commit, rejected
-            )
             thread = alm.create_thread_comment(pr_id, comment_text)
-            log.info("    Комментарий создан, thread id=%s", thread.get("id"))
+            review_thread_id = thread.get("id")
+            log.info(
+                "    Комментарий создан, thread id=%s", review_thread_id
+            )
         except Exception as exc:
             log.warning("    Не удалось отправить комментарий в PR #%s: %s", pr_id, exc)
     else:
         log.info("    Отправка комментариев отключена (POST_COMMENTS=false).")
 
+    end_to_end_ms = int((time.monotonic() - started) * 1000)
     log.info(
         "    PR #%s обработан за %dms (end-to-end)",
         pr_id,
-        int((time.monotonic() - started) * 1000),
+        end_to_end_ms,
     )
     return {
         "pr_id": pr_id,
@@ -1125,6 +1134,20 @@ def _review_one_pr(
         "latency_ms": llm_latency_ms,
         "tokens": llm_tokens,
         "rejected": rejected,
+        "metrics": {
+            "project": settings.azure_project,
+            "repo": settings.azure_repo,
+            "pr_id": pr_id,
+            "source_commit": src_commit,
+            "review_thread_id": review_thread_id,
+            "review_date": datetime.now(timezone.utc),
+            "review_verdict": verdict,
+            "content": content_chars,
+            "context_chars": context_chars,
+            "tokens": llm_tokens,
+            "latency_ms": end_to_end_ms,
+            "llm_latency_ms": llm_latency_ms,
+        },
     }
 
 
@@ -1213,6 +1236,8 @@ def run_review(
         )
         if result is not None:
             results.append(result)
+            # Метрики пишутся best-effort: ошибка БД не валит ревью.
+            record_review(result.get("metrics"))
 
     log.info("=" * 60)
     log.info("ГОТОВО: обработано PR — %d", len(results))

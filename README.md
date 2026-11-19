@@ -418,6 +418,35 @@ eval на golden-датасете.
 Запускается через Trigger DAG w/ config; самодостаточен — нужен только
 Connection `llm_server`, папка `loader/src` не требуется.
 
+### Метрики в GreenPlum
+
+После каждого сформированного ревью `metrics.py` пишет одну строку в
+`prj_brddwh.serv_git_auto_review` (Airflow Connection `edw_klad-pbrddw`,
+psycopg2). Запись best-effort: ошибка БД логируется, но не валит ревью.
+
+| Колонка | Смысл |
+|---|---|
+| `project`, `repo`, `pr_id` | Идентификация PR |
+| `source_commit` | Проверенный source-коммит (ключ идемпотентности) |
+| `review_thread_id` | ID thread комментария в ADO (`NULL`, если не публиковался) |
+| `review_date` | Время завершения ревью, UTC |
+| `review_verdict` | `approve` / `comment` / `request_changes` / `forbidden` |
+| `content` | Длина markdown-комментария ревью, символов |
+| `context_chars` | Суммарный объём контекста файлов в промпте, символов |
+| `tokens` | Суммарные токены LLM (prompt + completion, все попытки) |
+| `latency_ms` | End-to-end задержка обработки PR, мс |
+| `llm_latency_ms` | Суммарная задержка вызовов LLM, мс |
+
+Повторный прогон того же коммита перезаписывает строку (`DELETE` + `INSERT` по
+`project, repo, pr_id, source_commit`), новый коммит даёт новую строку.
+Пишутся только фактические ревью; dedup-пропуски и ошибки пока не пишутся.
+
+Таблица создаётся вручную (DBA/администратором БД). Агент DDL не выполняет —
+только `DELETE` + `INSERT` существующей таблицы; при ошибке БД ревью продолжается.
+Настройки: `METRICS_ENABLED`, `METRICS_DB_CONN_ID`, `METRICS_TABLE`
+(см. `.env.example`). В окружении воркера нужен `psycopg2` (обычно уже есть
+в Airflow вместе с Postgres-провайдером).
+
 ## Конфигурация
 
 Конфигурация задаётся переменными окружения (см. `.env.example`):

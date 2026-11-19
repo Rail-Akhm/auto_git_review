@@ -67,6 +67,16 @@ Azure DevOps Server (on-prem ALM).
 - **Мониторинг прогона:** `monitoring.py` агрегирует результаты в сводные метрики
   (распределение по вердиктам, суммарная латентность/токены/стоимость) и пишет их
   одной JSON-строкой `REVIEW_RUN_METRICS` в конце `run_review()`.
+- **Метрики в GreenPlum:** `metrics.py` после каждого сформированного ревью пишет
+  одну строку в `prj_brddwh.serv_git_auto_review` через Airflow Connection
+  `edw_klad-pbrddw` (psycopg2). Поля: project/repo/pr_id/source_commit,
+  review_thread_id, review_date, review_verdict, content (длина комментария),
+  context_chars, tokens, latency_ms (end-to-end), llm_latency_ms. Запись
+  best-effort — ошибка БД не валит ревью; перед INSERT строка с тем же
+  (project, repo, pr_id, source_commit) удаляется, поэтому повторный прогон не
+  плодит дубли. Таблица создаётся вручную; агент DDL не выполняет, только
+  `DELETE` + `INSERT`. Env: `METRICS_ENABLED`, `METRICS_DB_CONN_ID`,
+  `METRICS_TABLE`.
 - **Оценка качества (eval):** `eval.py` считает accuracy / Precision / Recall / F1
   по вердиктам (`forbidden` / `request_changes` / `comment` / `approve`) и
   confusion matrix на golden-датасете; схема датасета —
